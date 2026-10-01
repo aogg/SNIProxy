@@ -22,3 +22,7 @@ Releases
 # vendor/
 
 SNIProxy
+
+# 本地运行日志与本地测试配置（不入库）
+*.log
+config.local.yaml
