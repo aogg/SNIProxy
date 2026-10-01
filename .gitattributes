@@ -1,0 +1,2 @@
+# 文本文件入库时统一规范为 LF（工作区行尾不影响 git status / diff / 提交内容）
+* text=auto
