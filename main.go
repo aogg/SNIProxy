@@ -22,6 +22,7 @@ var (
 	ConfigFilePath string // 配置文件
 	LogFilePath    string // 日志文件
 	EnableDebug    bool   // 调试模式（详细日志）
+	printVersion   bool   // 程序版本
 
 	ForwardPort = 443       // 要转发至的目标端口
 	cfg         configModel // 配置文件结构
@@ -29,18 +30,19 @@ var (
 
 // 配置文件结构
 type configModel struct {
-	ForwardRules   []string `yaml:"rules,omitempty"`
-	ListenAddr     string   `yaml:"listen_addr,omitempty"`
-	ListenAddrHTTP string   `yaml:"listen_addr_http,omitempty"`
-	EnableSocks    bool     `yaml:"enable_socks5,omitempty"`
-	SocksAddr      string   `yaml:"socks_addr,omitempty"`
-	SocksUsername  string   `yaml:"socks_username,omitempty"`
-	SocksPassword  string   `yaml:"socks_password,omitempty"`
-	AllowAllHosts  bool     `yaml:"allow_all_hosts,omitempty"`
+	ForwardRules     []string `yaml:"rules,omitempty"`
+	ListenAddr       string   `yaml:"listen_addr,omitempty"`
+	ListenAddrHTTP   string   `yaml:"listen_addr_http,omitempty"`
+	EnableSocks      bool     `yaml:"enable_socks5,omitempty"`
+	SocksAddr        string   `yaml:"socks_addr,omitempty"`
+	SocksUsername    string   `yaml:"socks_username,omitempty"`
+	SocksPassword    string   `yaml:"socks_password,omitempty"`
+	AllowAllHosts    bool     `yaml:"allow_all_hosts,omitempty"`
+	DialTimeout      int      `yaml:"dial_timeout,omitempty"`       // 连接单个后端 IP 的超时时间（秒）
+	FirstByteTimeout int      `yaml:"first_byte_timeout,omitempty"` // 等待后端响应第一个字节的超时时间（秒）
 }
 
 func init() {
-	var printVersion bool
 	var help = `
 SNIProxy ` + version + `
 https://github.com/XIU2/SNIProxy
@@ -62,6 +64,10 @@ https://github.com/XIU2/SNIProxy
 	flag.BoolVar(&EnableDebug, "d", false, "调试模式")
 	flag.BoolVar(&printVersion, "v", false, "程序版本")
 	flag.Usage = func() { fmt.Print(help) }
+}
+
+// parseFlags 解析命令行参数（单独放出来、不放在 init() 里是为了能正常跑单元测试）
+func parseFlags() {
 	flag.Parse()
 	if printVersion {
 		fmt.Printf("XIU2/SNIProxy %s\n", version)
@@ -70,6 +76,8 @@ https://github.com/XIU2/SNIProxy
 }
 
 func main() {
+	parseFlags()
+
 	data, err := os.ReadFile(ConfigFilePath) // 读取配置文件
 	if err != nil {
 		serviceLogger(fmt.Sprintf("配置文件读取失败: %v", err), 31, false)
@@ -86,20 +94,29 @@ func main() {
 	if len(cfg.ListenAddr) <= 0 {
 		cfg.ListenAddr = ":443" // 如果没有指定 listen_addr 则默认监听 443 端口
 	}
+	if cfg.DialTimeout <= 0 {
+		cfg.DialTimeout = 5 // 连接单个后端 IP 的默认超时时间（秒）
+	}
+	if cfg.FirstByteTimeout <= 0 {
+		cfg.FirstByteTimeout = 5 // 等待后端响应第一个字节的默认超时时间（秒）
+	}
 	for _, rule := range cfg.ForwardRules { // 输出规则中的所有域名
 		serviceLogger(fmt.Sprintf("加载规则: %v", rule), 32, false)
 	}
 	serviceLogger(fmt.Sprintf("调试模式: %v", EnableDebug), 32, false)
 	serviceLogger(fmt.Sprintf("前置代理: %v", cfg.EnableSocks), 32, false)
 	serviceLogger(fmt.Sprintf("任意域名: %v", cfg.AllowAllHosts), 32, false)
+	serviceLogger(fmt.Sprintf("DNS重试: 开启 (连接超时: %d秒, 首字节超时: %d秒)", cfg.DialTimeout, cfg.FirstByteTimeout), 32, false)
 
 	startSniProxy() // 启动 SNI Proxy
 }
 
 // 启动 SNI Proxy
 func startSniProxy() {
-	_, cancel := context.WithCancel(context.Background())
+	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
+
+	dnsRetryCacheInstance.startJanitor(ctx) // 定期清理过期的 DNS 重试结果
 
 	// 如果配置了 listen_addr_http，则启动 HTTP 监听（用于 301 重定向至 HTTPS）
 	if cfg.ListenAddrHTTP != "" {
@@ -323,26 +340,46 @@ func getSNIServerName(buf []byte) string {
 }
 
 // forward 函数接收一个 net.Conn 类型的连接对象 conn、一个 []byte 类型的数据 data、一个目标地址 dst 和一个来源地址 raddr
-// 该函数使用 GetDialer 函数创建一个与目标地址 dst 的后端连接 backend，将 data 写入 backend，然后使用 ioReflector 函数将 backend 和 conn 连接起来，以便将数据从一个连接转发到另一个连接
+// 该函数先解析 dst 得到全部候选 IP（DNS 对同一域名可能返回多个 A/AAAA 记录），
+// 再由 dialBackendRetry 按“上次连接结果”排序后依次尝试连接（连接失败会在内部自动重试下一个 IP，对客户端透明，
+// 且每次结果都会记录下来，下次连接同一域名时优先使用上次成功的 IP），
+// 连接成功后将 data 写入 backend，然后使用 ioReflector 函数将 backend 和 conn 连接起来，以便将数据从一个连接转发到另一个连接
 func forward(conn net.Conn, data []byte, dst string, raddr string) {
+	// 从 host:port 中提取 host，后续用于 DNS 解析与 IP 比较
+	host, port, err := net.SplitHostPort(dst)
+	if err != nil {
+		serviceLogger(fmt.Sprintf("目标地址格式错误(HTTPS): \"%s\", %v", dst, err), 31, false)
+		return
+	}
+
+	// 解析目标 host，拿到所有候选 IP（支持直接 IP 或域名）
+	ips, err := resolveHostIPs(host)
+	if err != nil {
+		serviceLogger(fmt.Sprintf("解析目标地址失败(HTTPS): \"%s\", %v", host, err), 31, false)
+		return
+	}
+
 	// 建立后端连接前先做安全检查，避免把流量再次传回本机导致死循环
-	if blocked, reason := shouldBlockForwardTarget(dst, raddr); blocked {
+	if blocked, reason := shouldBlockForwardIPs(ips, raddr); blocked {
 		serviceLogger(fmt.Sprintf("拒绝转发(HTTPS): \"%s\", 目标: [%s], 来源: [%s]", reason, dst, raddr), 31, false)
 		return
 	}
 
-	backend, err := GetDialer(cfg.EnableSocks).Dial("tcp", dst)
-	if err != nil {
-		serviceLogger(fmt.Sprintf("无法连接到后端(HTTPS), %v", err), 31, false)
+	// 按历史结果排序后依次尝试连接所有候选 IP（内部自动重试）
+	backend, first := dialBackendRetry(host, port, ips, data)
+	if backend == nil {
+		serviceLogger(fmt.Sprintf("所有后端 IP 连接失败(HTTPS): [%s], 共尝试 %d 个", dst, len(ips)), 31, false)
 		return
 	}
-
 	defer backend.Close()
 
-	if _, err = backend.Write(data); err != nil {
-		serviceLogger(fmt.Sprintf("无法传输到后端(HTTPS), %v", err), 31, false)
-		return
+	if len(first) > 0 { // 把等待首字节时提前读到的后端响应，先发回给客户端
+		if _, err := conn.Write(first); err != nil {
+			serviceLogger(fmt.Sprintf("无法传输到客户端(HTTPS), %v", err), 31, false)
+			return
+		}
 	}
+
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 
@@ -354,22 +391,10 @@ func forward(conn net.Conn, data []byte, dst string, raddr string) {
 	cancel()
 }
 
-// shouldBlockForwardTarget 在建立后端连接前判断目标地址是否有问题
-func shouldBlockForwardTarget(dst string, raddr string) (bool, string) {
-	// 从 host:port 中提取 host，后续用于 DNS 解析与 IP 比较
-	host, _, err := net.SplitHostPort(dst)
-	if err != nil {
-		return true, fmt.Sprintf("目标地址格式错误: %v", err)
-	}
-
+// shouldBlockForwardIPs 在建立后端连接前判断目标 IP 列表是否有问题（DNS 解析由调用方完成，避免重复解析）
+func shouldBlockForwardIPs(targetIPs []net.IP, raddr string) (bool, string) {
 	// 将来源地址转换为 IP，便于判断“目标 IP 和来源 IP 相同”的场景
 	srcIP := extractIPFromAddr(raddr)
-
-	// 解析目标 host，拿到所有候选 IP（支持直接 IP 或域名）
-	targetIPs, err := resolveHostIPs(host)
-	if err != nil {
-		return true, fmt.Sprintf("解析目标地址失败: %v", err)
-	}
 
 	// 获取本机所有网卡 IP（含回环），用于识别“目标是否本机”
 	localIPs, err := collectLocalIPs()
@@ -410,10 +435,25 @@ func resolveHostIPs(host string) ([]net.IP, error) {
 	if err != nil {
 		return nil, err
 	}
+	ips = dedupeIPs(ips) // 去重（系统解析器可能将同一 IP 重复返回多次）
 	if len(ips) == 0 {
 		return nil, fmt.Errorf("未解析到任何IP")
 	}
 	return ips, nil
+}
+
+// dedupeIPs 对 IP 列表去重，保持首次出现的顺序
+func dedupeIPs(ips []net.IP) []net.IP {
+	seen := make(map[string]bool, len(ips))
+	unique := make([]net.IP, 0, len(ips))
+	for _, ip := range ips {
+		key := ip.String()
+		if !seen[key] {
+			seen[key] = true
+			unique = append(unique, ip)
+		}
+	}
+	return unique
 }
 
 // collectLocalIPs 收集本机网卡地址，供“目标是否本机IP”判断使用

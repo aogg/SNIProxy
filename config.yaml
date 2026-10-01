@@ -11,6 +11,10 @@ listen_addr: ":443"
 #socks_username: admin
 #socks_password: abc123
 
+# 可选：DNS 对同一域名返回多个 IP 时，连接失败会在内部自动重试下一个 IP（以下为默认值，单位：秒）
+#dial_timeout: 5       # 连接单个后端 IP 的超时时间，超时后自动尝试下一个 IP
+#first_byte_timeout: 5 # 连接后等待后端响应第一个字节的超时时间，超时说明该 IP 已假死，自动尝试下一个 IP
+
 # 二选一：允许所有域名（开启后会忽略下面的 rules 列表，二选一）
 #allow_all_hosts: true
 
