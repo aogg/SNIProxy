@@ -1,3 +1,8 @@
+# 增加
+- 根据dns返回的多个host自动重试
+
+
+
 # XIU2/SNIProxy
 
 [![Go Version](https://img.shields.io/github/go-mod/go-version/XIU2/SNIProxy.svg?style=flat-square&label=Go&color=00ADD8&logo=go)](https://github.com/XIU2/SNIProxy/)
