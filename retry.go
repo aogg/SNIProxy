@@ -2,6 +2,7 @@ package main
 
 import (
 	"context"
+	"crypto/tls"
 	"fmt"
 	"net"
 	"sort"
@@ -10,6 +11,12 @@ import (
 	"time"
 
 	"golang.org/x/net/proxy"
+)
+
+// TLS 验证结果的缓存时长
+const (
+	verifySuccessTTL = 10 * time.Minute // 验证通过：10 分钟内直接复用结果，不再重复探测
+	verifyFailTTL    = 60 * time.Second // 验证失败：60 秒内不再探测、直接跳过该 IP，之后允许重新验证
 )
 
 // ipStat 记录某个后端 IP 的历史连接结果，用于下次按“上次结果”排序转发
@@ -21,16 +28,27 @@ type ipStat struct {
 	lastFail    time.Time // 最近一次失败时间
 }
 
+// verifyResult 记录某个 域名+IP 的真实 TLS 验证结果
+type verifyResult struct {
+	ok     bool      // 是否验证通过（真实 TLS 握手成功且证书校验通过）
+	at     time.Time // 验证时间（用于判断缓存是否过期）
+	reason string    // 失败原因（仅用于日志输出）
+}
+
 // dnsRetryCache 按“域名 -> IP -> 连接结果”存储 DNS 多 IP 自动重试的结果
 // 这样下次连接同一域名时，可以优先使用上次成功过的 IP，把上次失败的 IP 排到最后
 // 说明：结果只保存在内存中，重启后清零（DNS 记录本身会变化，持久化反而容易用到已失效的旧 IP）
 type dnsRetryCache struct {
-	mu    sync.Mutex
-	stats map[string]map[string]*ipStat
+	mu     sync.Mutex
+	stats  map[string]map[string]*ipStat       // 域名 -> IP -> 连接结果
+	verify map[string]map[string]*verifyResult // 域名 -> IP -> 真实 TLS 验证结果
 }
 
 // dnsRetryCache 全局唯一实例
-var dnsRetryCacheInstance = &dnsRetryCache{stats: make(map[string]map[string]*ipStat)}
+var dnsRetryCacheInstance = &dnsRetryCache{
+	stats:  make(map[string]map[string]*ipStat),
+	verify: make(map[string]map[string]*verifyResult),
+}
 
 // reportResult 记录一次后端 IP 的连接结果（成功/失败），并发安全
 func (c *dnsRetryCache) reportResult(host, ip string, success bool) {
@@ -57,6 +75,46 @@ func (c *dnsRetryCache) reportResult(host, ip string, success bool) {
 		st.consecFail++
 		st.lastFail = now
 	}
+}
+
+// getVerifyResult 查询 域名+IP 的真实 TLS 验证结果缓存（并发安全）
+// 命中且未过期时返回 (结果, true)；未缓存或已过期时返回 (nil, false)（过期条目会被顺带删除）
+func (c *dnsRetryCache) getVerifyResult(host, ip string) (*verifyResult, bool) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+
+	r, ok := c.verify[host][ip]
+	if !ok {
+		return nil, false
+	}
+	ttl := verifyFailTTL
+	if r.ok {
+		ttl = verifySuccessTTL
+	}
+	if time.Since(r.at) > ttl { // 已过期，视为未验证过
+		delete(c.verify[host], ip)
+		if len(c.verify[host]) == 0 {
+			delete(c.verify, host)
+		}
+		return nil, false
+	}
+	return r, true
+}
+
+// setVerifyResult 写入 域名+IP 的真实 TLS 验证结果缓存（并发安全）
+func (c *dnsRetryCache) setVerifyResult(host, ip string, ok bool, reason string) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+
+	if c.verify == nil { // 兼容直接构造的空缓存（未初始化 verify 的场景）
+		c.verify = make(map[string]map[string]*verifyResult)
+	}
+	m := c.verify[host]
+	if m == nil {
+		m = make(map[string]*verifyResult)
+		c.verify[host] = m
+	}
+	m[ip] = &verifyResult{ok: ok, at: time.Now(), reason: reason}
 }
 
 // orderIPs 根据历史连接结果，对本次 DNS 返回的候选 IP 列表排序，排序规则如下：
@@ -121,7 +179,8 @@ func (c *dnsRetryCache) orderIPs(host string, ips []net.IP) []net.IP {
 	return ordered
 }
 
-// cleanup 清理长时间没有连接记录的域名/IP（内存兜底，防止 allow_all_hosts 时无限增长）
+// cleanup 清理长时间没有连接记录的域名/IP，以及已过期的 TLS 验证结果缓存
+// （内存兜底，防止 allow_all_hosts 时无限增长）
 func (c *dnsRetryCache) cleanup(maxIdle time.Duration) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
@@ -139,6 +198,21 @@ func (c *dnsRetryCache) cleanup(maxIdle time.Duration) {
 		}
 		if len(m) == 0 {
 			delete(c.stats, host)
+		}
+	}
+	// 按成功/失败各自的 TTL 清理 TLS 验证结果缓存
+	for host, m := range c.verify {
+		for k, r := range m {
+			ttl := verifyFailTTL
+			if r.ok {
+				ttl = verifySuccessTTL
+			}
+			if now.Sub(r.at) > ttl {
+				delete(m, k)
+			}
+		}
+		if len(m) == 0 {
+			delete(c.verify, host)
 		}
 	}
 }
@@ -181,6 +255,52 @@ func dialWithTimeout(network, addr string, timeoutSec int) (net.Conn, error) {
 	return d.Dial(network, addr)
 }
 
+// isVerifyTLSEnabled 返回是否启用后端真实 TLS 验证（verify_tls 未配置时默认开启）
+func isVerifyTLSEnabled() bool {
+	return cfg.VerifyTLS == nil || *cfg.VerifyTLS
+}
+
+// verifyProbeTimeout 返回探测握手的超时时间（秒）：复用 first_byte_timeout；
+// verify_tls 关闭或 first_byte_timeout 为 0/负数时返回 0（表示不探测，完全保持旧行为）
+func verifyProbeTimeout() int {
+	if !isVerifyTLSEnabled() || cfg.FirstByteTimeout <= 0 {
+		return 0
+	}
+	return cfg.FirstByteTimeout
+}
+
+// verifyBackend 通过一次真实的 TLS 客户端握手来验证候选 IP 是否真的可用：
+// 先拨号到 addr（复用 dialWithTimeout，保证 SOCKS5 前置代理可用），
+// 再以 ServerName=host 发起完整证书校验（InsecureSkipVerify=false）的 TLS 握手，
+// 握手成功（含证书校验通过）才认为该 IP 可用，返回 nil；否则返回具体失败原因。
+// 整个探测（拨号 + 握手）受 timeoutSec 秒的总超时限制，超时同样视为验证失败。
+func verifyBackend(addr, host string, timeoutSec int) error {
+	if timeoutSec <= 0 {
+		return nil // 配置为不探测（调用方不会以 0 调用，此处仅兜底，视为通过）
+	}
+	deadline := time.Now().Add(time.Duration(timeoutSec) * time.Second)
+
+	backend, err := dialWithTimeout("tcp", addr, timeoutSec)
+	if err != nil {
+		return fmt.Errorf("拨号失败: %v", err)
+	}
+	defer backend.Close() // 探测连接用完即关，真实转发由后续正常流程重新建立连接
+
+	if err := backend.SetDeadline(deadline); err != nil { // 让整个 TLS 握手也受同一超时限制
+		return fmt.Errorf("设置超时失败: %v", err)
+	}
+
+	conn := tls.Client(backend, &tls.Config{
+		ServerName:         host,  // 以目标域名做 SNI 与证书匹配
+		InsecureSkipVerify: false, // 显式启用完整证书校验（证书不匹配/过期/自签名都算失败）
+	})
+	defer conn.Close()
+	if err := conn.Handshake(); err != nil {
+		return fmt.Errorf("TLS握手失败: %v", err)
+	}
+	return nil
+}
+
 // peekFirstByte 在超时时间内等待后端返回第一个响应字节，用于识别
 // “TCP 连接成功、数据也发出去了，但后端服务其实已经假死/无响应”的情况，
 // 避免把客户端交给一个看着连上了、实际不通的后端。
@@ -204,10 +324,36 @@ func peekFirstByte(backend net.Conn, timeoutSec int) (first []byte, ok bool) {
 	return nil, true // n=0 且无错误（很少见），视为后端可用
 }
 
+// isValidServerHello 校验 peekFirstByte 读到的首个响应是不是合法的 TLS 握手记录：
+// 记录类型必须为 handshake(0x16)，且第一条握手消息类型必须为 ServerHello(2)；
+// alert(0x15)、明文 "HTTP/"（如被劫持后返回的错误页）、数据长度不足等情况都视为失败。
+// 纯内存判断（不含任何 IO），方便单元测试。
+func isValidServerHello(first []byte) bool {
+	// 需要至少：TLS 记录头 5 字节（类型1 + 版本2 + 长度2）+ 握手消息头 4 字节（类型1 + 长度3）
+	if len(first) < 9 {
+		return false // 数据长度不足，无法构成合法的 TLS 握手记录
+	}
+	if recordType(first[0]) != recordTypeHandshake {
+		return false // 不是 handshake 记录（如 0x15=alert、明文 "HTTP/" 等）
+	}
+	if first[1] != 3 {
+		return false // TLS 主要版本必须为 3（与 getSNIServerName 的判断保持一致）
+	}
+	if first[5] != typeServerHello {
+		return false // 第一条握手消息不是 ServerHello
+	}
+	length := int(first[3])<<8 | int(first[4])
+	return length >= 4 // 记录负载至少要容纳 4 字节的握手消息头，否则也是异常响应
+}
+
 // dialBackendRetry 按“上次连接结果”排序后依次尝试连接 host 的所有候选 IP：
-//  1. 连接某个 IP 失败（连接被拒/超时等）-> 自动重试下一个 IP
-//  2. 连接成功但发送握手数据失败     -> 自动重试下一个 IP
-//  3. 连接成功但等待后端响应超时     -> 自动重试下一个 IP
+//
+//	1.（TLS 验证开启时）先用真实 TLS 握手验证该 IP（结果缓存：成功 10 分钟、失败 60 秒）
+//	   -> 验证失败（含证书校验失败）或 60 秒内验证失败过的 IP，自动换下一个 IP
+//	2. 连接某个 IP 失败（连接被拒/超时等）-> 自动重试下一个 IP
+//	3. 连接成功但发送握手数据失败     -> 自动重试下一个 IP
+//	4. 连接成功但等待后端响应超时     -> 自动重试下一个 IP
+//	5. 连接成功但首个响应不是合法的 TLS ServerHello 记录 -> 按连接失败处理，自动重试下一个 IP
 //
 // 整个重试过程都在 SNIProxy 内部完成，对客户端完全透明（此时还没有任何数据发给客户端）。
 // 每次尝试的结果都会记录到 dnsRetryCache，下次连接同一域名时按上次结果排序转发。
@@ -216,9 +362,32 @@ func dialBackendRetry(host, port string, ips []net.IP, data []byte) (net.Conn, [
 	ordered := dnsRetryCacheInstance.orderIPs(host, ips)
 	serviceLogger(fmt.Sprintf("候选IP顺序: %s -> [%s]", host, joinIPs(ordered)), 36, true)
 
+	probeTimeout := verifyProbeTimeout() // 为 0 时表示不探测（verify_tls=false 等），完全保持旧行为
+
 	for i, ip := range ordered {
 		addr := net.JoinHostPort(ip.String(), port)
 		attempt := fmt.Sprintf("(%d/%d)", i+1, len(ordered))
+
+		// 后端真实 TLS 验证：候选 IP 必须通过一次真实 TLS 握手（含完整证书校验）才算可用
+		if probeTimeout > 0 {
+			if r, hit := dnsRetryCacheInstance.getVerifyResult(host, ip.String()); !hit {
+				// 未验证过（或缓存已过期）：先探测再连接
+				if err := verifyBackend(addr, host, probeTimeout); err != nil {
+					// 验证失败按连接失败处理：记 fail、缓存失败结果，60 秒内不再探测该 IP
+					dnsRetryCacheInstance.setVerifyResult(host, ip.String(), false, err.Error())
+					dnsRetryCacheInstance.reportResult(host, ip.String(), false)
+					serviceLogger(fmt.Sprintf("后端验证失败%s: [%s], %v", attempt, addr, err), 31, false)
+					continue
+				}
+				dnsRetryCacheInstance.setVerifyResult(host, ip.String(), true, "")
+				serviceLogger(fmt.Sprintf("后端验证通过%s: [%s]", attempt, addr), 32, false)
+			} else if !r.ok {
+				// 60 秒内验证失败过的 IP 直接跳过，不再探测
+				serviceLogger(fmt.Sprintf("后端验证失败(缓存)%s: [%s], %s, 跳过", attempt, addr, r.reason), 31, true)
+				continue
+			}
+			// 验证通过（含 10 分钟内缓存命中），继续走下面的正常连接流程
+		}
 
 		backend, err := dialWithTimeout("tcp", addr, cfg.DialTimeout)
 		if err != nil { // 连接失败，记录结果并自动重试下一个 IP
@@ -240,6 +409,14 @@ func dialBackendRetry(host, port string, ips []net.IP, data []byte) (net.Conn, [
 			backend.Close()
 			dnsRetryCacheInstance.reportResult(host, ip.String(), false)
 			serviceLogger(fmt.Sprintf("后端无响应%s: [%s]", attempt, addr), 31, false)
+			continue
+		}
+
+		// 校验首个响应是不是合法的 TLS 握手记录（识别“回了数据但不是正常 TLS 服务”的坏 IP）
+		if probeTimeout > 0 && !isValidServerHello(first) {
+			backend.Close()
+			dnsRetryCacheInstance.reportResult(host, ip.String(), false)
+			serviceLogger(fmt.Sprintf("后端响应异常%s: [%s], 不是合法的 TLS ServerHello 记录", attempt, addr), 31, false)
 			continue
 		}
 

@@ -117,6 +117,8 @@ func fakeBackend(t *testing.T, ln net.Listener, response string) {
 }
 
 func TestDialBackendRetry_Failover(t *testing.T) {
+	saveCfg(t)                     // 测完恢复 cfg，避免影响其他用例
+	cfg.VerifyTLS = boolPtr(false) // 本用例的假后端回的是明文(非 TLS)，关闭 verify_tls 以保留原有 failover 语义
 	cfg.DialTimeout = 2
 	cfg.FirstByteTimeout = 2
 
@@ -159,6 +161,7 @@ func TestDialBackendRetry_Failover(t *testing.T) {
 }
 
 func TestDialBackendRetry_AllFail(t *testing.T) {
+	saveCfg(t) // 测完恢复 cfg，避免影响其他用例
 	cfg.DialTimeout = 2
 	cfg.FirstByteTimeout = 2
 
@@ -177,6 +180,7 @@ func TestDialBackendRetry_AllFail(t *testing.T) {
 }
 
 func TestDialBackendRetry_DeadBackendNoResponse(t *testing.T) {
+	saveCfg(t) // 测完恢复 cfg，避免影响其他用例
 	cfg.DialTimeout = 2
 	cfg.FirstByteTimeout = 1
 

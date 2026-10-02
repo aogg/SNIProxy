@@ -40,6 +40,7 @@ type configModel struct {
 	AllowAllHosts    bool     `yaml:"allow_all_hosts,omitempty"`
 	DialTimeout      int      `yaml:"dial_timeout,omitempty"`       // 连接单个后端 IP 的超时时间（秒）
 	FirstByteTimeout int      `yaml:"first_byte_timeout,omitempty"` // 等待后端响应第一个字节的超时时间（秒）
+	VerifyTLS        *bool    `yaml:"verify_tls,omitempty"`         // 连接前是否用真实 TLS 握手验证候选 IP（指针是为了区分“未配置”，未配置时默认开启）
 }
 
 func init() {
@@ -106,7 +107,11 @@ func main() {
 	serviceLogger(fmt.Sprintf("调试模式: %v", EnableDebug), 32, false)
 	serviceLogger(fmt.Sprintf("前置代理: %v", cfg.EnableSocks), 32, false)
 	serviceLogger(fmt.Sprintf("任意域名: %v", cfg.AllowAllHosts), 32, false)
-	serviceLogger(fmt.Sprintf("DNS重试: 开启 (连接超时: %d秒, 首字节超时: %d秒)", cfg.DialTimeout, cfg.FirstByteTimeout), 32, false)
+	verifyState := "关闭"
+	if isVerifyTLSEnabled() && cfg.FirstByteTimeout > 0 {
+		verifyState = fmt.Sprintf("开启, 探测超时: %d秒", cfg.FirstByteTimeout)
+	}
+	serviceLogger(fmt.Sprintf("DNS重试: 开启 (连接超时: %d秒, 首字节超时: %d秒, TLS验证: %s)", cfg.DialTimeout, cfg.FirstByteTimeout, verifyState), 32, false)
 
 	startSniProxy() // 启动 SNI Proxy
 }
@@ -341,7 +346,8 @@ func getSNIServerName(buf []byte) string {
 
 // forward 函数接收一个 net.Conn 类型的连接对象 conn、一个 []byte 类型的数据 data、一个目标地址 dst 和一个来源地址 raddr
 // 该函数先解析 dst 得到全部候选 IP（DNS 对同一域名可能返回多个 A/AAAA 记录），
-// 再由 dialBackendRetry 按“上次连接结果”排序后依次尝试连接（连接失败会在内部自动重试下一个 IP，对客户端透明，
+// 再由 dialBackendRetry 按“上次连接结果”排序后依次尝试连接（开启 verify_tls 时会先用真实 TLS 握手验证候选 IP，
+// 验证失败/连接失败会在内部自动重试下一个 IP，对客户端透明，
 // 且每次结果都会记录下来，下次连接同一域名时优先使用上次成功的 IP），
 // 连接成功后将 data 写入 backend，然后使用 ioReflector 函数将 backend 和 conn 连接起来，以便将数据从一个连接转发到另一个连接
 func forward(conn net.Conn, data []byte, dst string, raddr string) {
