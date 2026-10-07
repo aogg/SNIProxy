@@ -10,6 +10,7 @@ import (
 	"os"
 	"os/signal"
 	"strings"
+	"sync/atomic"
 	"syscall"
 	"time"
 
@@ -27,6 +28,50 @@ var (
 	ForwardPort = 443       // 要转发至的目标端口
 	cfg         configModel // 配置文件结构
 )
+
+// 连接级日志的阶段标记：区分日志发生在“连接后端成功前”还是“成功后”
+const (
+	stagePreConnect = "连前" // 尚未与后端建立可用连接的阶段（连接来自/握手/SNI/白名单/DNS/安全拒绝/TLS验证/连接重试等）
+	stageConnected  = "已连" // 已成功连接后端及之后的阶段（连接后端成功/首包回写客户端/双向转发字节数等）
+)
+
+// connIDSeq 全局连接 ID 计数器（Accept 到连接时原子自增，从 1 开始）
+var connIDSeq int64
+
+// connCtx 连接上下文：在 Accept 到连接时创建，贯穿该连接整个生命周期，
+// 用于给所有连接级日志统一加上 “连接 ID + 域名 + 阶段” 前缀，方便区分是哪个连接、哪个域名发出的请求
+type connCtx struct {
+	id      int64  // 连接 ID（全局唯一，从 1 开始递增，日志中显示为 #<id>）
+	srcAddr string // 客户端来源地址（host:port）
+	host    string // 域名（解析出 SNI/Host 之前为 "-" 占位）
+}
+
+// newConnCtx 创建连接上下文（在 Accept 到连接时调用，为连接分配全局唯一 ID）
+func newConnCtx(srcAddr string) *connCtx {
+	return &connCtx{
+		id:      atomic.AddInt64(&connIDSeq, 1),
+		srcAddr: srcAddr,
+		host:    "-",
+	}
+}
+
+// setHost 更新域名（解析出 SNI/Host 之后调用，仅在该连接的转发协程内更新）
+func (c *connCtx) setHost(host string) {
+	if host != "" {
+		c.host = host
+	}
+}
+
+// prefix 生成连接级日志前缀：[#42 域名]（域名未知时为 [#42 -]）
+func (c *connCtx) prefix() string {
+	return fmt.Sprintf("[#%d %s]", c.id, c.host)
+}
+
+// logf 输出一条连接级日志："[#42 域名] [阶段] 内容"
+// 颜色/debug/写文件逻辑复用 serviceLogger，各日志行的级别与颜色语义保持不变
+func (c *connCtx) logf(stage string, color int, isDebug bool, format string, v ...interface{}) {
+	serviceLogger(c.prefix()+" ["+stage+"] "+fmt.Sprintf(format, v...), color, isDebug)
+}
 
 // 配置文件结构
 type configModel struct {
@@ -141,8 +186,9 @@ func startSniProxy() {
 					continue
 				}
 				raddr := conn.RemoteAddr().(*net.TCPAddr)
-				serviceLogger("连接来自: "+raddr.String(), 32, false)
-				go handleHTTPRedirect(conn) // 有新连接进来，启动一个新线程处理
+				c := newConnCtx(raddr.String()) // 为连接分配全局唯一 ID
+				c.logf(stagePreConnect, 32, false, "连接来自: [%s]", c.srcAddr)
+				go handleHTTPRedirect(conn, c) // 有新连接进来，启动一个新线程处理
 			}
 		}(listenerHTTP)
 	}
@@ -164,8 +210,9 @@ func startSniProxy() {
 				continue
 			}
 			raddr := conn.RemoteAddr().(*net.TCPAddr)
-			serviceLogger("连接来自: "+raddr.String(), 32, false)
-			go serve(conn, raddr.String()) // 有新连接进来，启动一个新线程处理
+			c := newConnCtx(raddr.String()) // 为连接分配全局唯一 ID
+			c.logf(stagePreConnect, 32, false, "连接来自: [%s]", c.srcAddr)
+			go serve(conn, c) // 有新连接进来，启动一个新线程处理
 		}
 	}(listener)
 
@@ -178,24 +225,24 @@ func startSniProxy() {
 }
 
 // 处理 HTTP 重定向至 HTTPS
-func handleHTTPRedirect(conn net.Conn) {
+func handleHTTPRedirect(conn net.Conn, c *connCtx) {
 	defer conn.Close()
 	buf := make([]byte, 1024)
 	n, err := conn.Read(buf)
 	if err != nil || n == 0 {
-		serviceLogger(fmt.Sprintf("读取连接请求时出错(HTTP): %v", err), 31, false)
+		c.logf(stagePreConnect, 31, false, "读取连接请求时出错(HTTP): %v", err)
 		return
 	}
 	data := string(buf[:n])
 	lines := strings.Split(data, "\r\n")
 	if len(lines) == 0 {
-		serviceLogger("不是 HTTP/1.1 消息", 31, true)
+		c.logf(stagePreConnect, 31, true, "不是 HTTP/1.1 消息")
 		return
 	}
 	// 解析请求行，获得路径
 	reqLine := strings.Fields(lines[0])
 	if len(reqLine) < 2 {
-		serviceLogger("解析 HTTP/1.1 请求异常", 31, true)
+		c.logf(stagePreConnect, 31, true, "解析 HTTP/1.1 请求异常")
 		return
 	}
 	path := reqLine[1]
@@ -209,39 +256,49 @@ func handleHTTPRedirect(conn net.Conn) {
 	}
 	// 如果没有 Host 或者 Host 为空，则不进行重定向，直接断开连接
 	if host == "" {
-		serviceLogger("未找到域名(HTTP), 忽略...", 31, true)
+		c.logf(stagePreConnect, 31, true, "未找到域名(HTTP), 忽略...")
 		return
 	}
+	c.setHost(host) // 域名已知，后续日志前缀带上域名
 
 	if cfg.AllowAllHosts { // 如果 allow_all_hosts 为 true 则代表无需判断 http 域名
-		sendHTTPRedirect(conn, host, path)
+		sendHTTPRedirect(conn, c, host, path)
 		return
 	}
-	for _, rule := range cfg.ForwardRules { // 循环遍历 Rules 中指定的白名单域名
-		if strings.Contains(host, rule) { // 如果 http 域名中包含 Rule 白名单域名（例如 www.aa.com 中包含 aa.com）则重定向该 HTTP 连接为 HTTPS
-			sendHTTPRedirect(conn, host, path)
-			return
-		} else {
-			serviceLogger(fmt.Sprintf("域名 %s 不在允许域名列表中, 忽略(http)...", host), 31, false)
-		}
+	// 白名单判定：先得出最终结果，未命中时每个连接只打一条日志（避免逐条规则重复打“忽略”）
+	if !matchForwardRules(host) {
+		c.logf(stagePreConnect, 31, false, "域名 %s 不在允许域名列表中, 忽略(http)...", host)
+		return
 	}
+	sendHTTPRedirect(conn, c, host, path)
 }
 
 // 发送 301 跳转响应的函数
-func sendHTTPRedirect(conn net.Conn, host, path string) {
+func sendHTTPRedirect(conn net.Conn, c *connCtx, host, path string) {
 	// 生成 301 重定向响应
 	location := "https://" + host + path
 	resp := fmt.Sprintf("HTTP/1.1 301 Moved Permanently\r\nLocation: %s\r\nConnection: close\r\nContent-Length: 0\r\n\r\n", location)
-	serviceLogger(fmt.Sprintf("重定向至: %s", location), 34, false)
+	c.logf(stagePreConnect, 34, false, "重定向至: %s", location)
 	// 发送响应
 	_, err := conn.Write([]byte(resp))
 	if err != nil {
-		serviceLogger(fmt.Sprintf("无法传输到后端(HTTP), %v", err), 31, false)
+		c.logf(stagePreConnect, 31, false, "无法传输到后端(HTTP), %v", err)
 	}
 }
 
+// matchForwardRules 判断域名是否命中转发规则白名单
+// （例如 www.aa.com 中包含规则 aa.com 则命中）
+func matchForwardRules(host string) bool {
+	for _, rule := range cfg.ForwardRules {
+		if strings.Contains(host, rule) {
+			return true
+		}
+	}
+	return false
+}
+
 // 处理 HTTPS 新连接
-func serve(conn net.Conn, raddr string) {
+func serve(conn net.Conn, c *connCtx) {
 	defer conn.Close()
 
 	buf := make([]byte, 2048)
@@ -252,13 +309,13 @@ func serve(conn net.Conn, raddr string) {
 	for {
 		n, err := conn.Read(buf)
 		if err != nil && err != io.EOF {
-			serviceLogger(fmt.Sprintf("读取连接请求时出错(HTTPS): %v", err), 31, false)
+			c.logf(stagePreConnect, 31, false, "读取连接请求时出错(HTTPS): %v", err)
 			return
 		}
 		fullHeader = append(fullHeader, buf[:n]...)
 
 		if len(fullHeader) < 5 { // 判断是不是 TLS 握手消息
-			serviceLogger("不是 TLS 握手消息", 31, true)
+			c.logf(stagePreConnect, 31, true, "不是 TLS 握手消息")
 			return
 		} else if IsCompleteHandshake(fullHeader) { // 检查是否已经接收到完整的 TLS 握手消息
 			break // 如果已经完整，那么退出循环
@@ -266,35 +323,29 @@ func serve(conn net.Conn, raddr string) {
 
 		attempts++
 		if attempts >= maxAttempts {
-			serviceLogger("接收握手消息超时...", 31, false)
+			c.logf(stagePreConnect, 31, false, "接收握手消息超时...")
 			return // 如果超过最大等待次数，退出函数
 		}
 	}
 	if attempts > 0 { // 如果等于 0 说明第一次就接收到了完整握手消息，如果大于 0 说明握手消息丢包或分段了
-		serviceLogger("已接收到完整握手消息...", 32, true)
+		c.logf(stagePreConnect, 32, true, "已接收到完整握手消息...")
 	}
 
-	ServerName := getSNIServerName(fullHeader) // 获取 SNI 域名
+	ServerName := getSNIServerName(fullHeader, c) // 获取 SNI 域名
 
 	if ServerName == "" {
-		serviceLogger("未找到 SNI 域名(HTTPS), 忽略...", 31, true)
+		c.logf(stagePreConnect, 31, true, "未找到 SNI 域名(HTTPS), 忽略...")
 		return
 	}
+	c.setHost(ServerName) // 域名已知，后续日志前缀带上域名
 
-	if cfg.AllowAllHosts { // 如果 allow_all_hosts 为 true 则代表无需判断 SNI 域名
-		serviceLogger(fmt.Sprintf("转发目标: %s:%d", ServerName, ForwardPort), 32, false)
-		forward(conn, fullHeader, fmt.Sprintf("%s:%d", ServerName, ForwardPort), raddr)
+	if !cfg.AllowAllHosts && !matchForwardRules(ServerName) {
+		// 白名单判定：先得出最终结果，未命中时每个连接只打一条日志（避免逐条规则重复打“忽略”）
+		c.logf(stagePreConnect, 31, false, "域名 %s 不在允许域名列表中, 忽略(https)...", ServerName)
 		return
 	}
-
-	for _, rule := range cfg.ForwardRules { // 循环遍历 Rules 中指定的白名单域名
-		if strings.Contains(ServerName, rule) { // 如果 SNI 域名中包含 Rule 白名单域名（例如 www.aa.com 中包含 aa.com）则转发该连接
-			serviceLogger(fmt.Sprintf("转发目标: %s:%d", ServerName, ForwardPort), 32, false)
-			forward(conn, fullHeader, fmt.Sprintf("%s:%d", ServerName, ForwardPort), raddr)
-		} else {
-			serviceLogger(fmt.Sprintf("域名 %s 不在允许域名列表中, 忽略(https)...", ServerName), 31, false)
-		}
-	}
+	c.logf(stagePreConnect, 32, false, "转发目标: %s:%d", ServerName, ForwardPort)
+	forward(conn, c, fullHeader, fmt.Sprintf("%s:%d", ServerName, ForwardPort))
 }
 
 // 判断握手消息是否完整
@@ -304,22 +355,22 @@ func IsCompleteHandshake(header []byte) bool {
 }
 
 // 获取 SNI 域名
-func getSNIServerName(buf []byte) string {
+func getSNIServerName(buf []byte, c *connCtx) string {
 	n := len(buf)
 	if n < 5 {
-		serviceLogger("不是 TLS 握手消息", 31, true)
+		c.logf(stagePreConnect, 31, true, "不是 TLS 握手消息")
 		return ""
 	}
 
 	// TLS 记录类型
 	if recordType(buf[0]) != recordTypeHandshake {
-		serviceLogger("不是 TLS", 31, true)
+		c.logf(stagePreConnect, 31, true, "不是 TLS")
 		return ""
 	}
 
 	// TLS 主要版本
 	if buf[1] != 3 {
-		serviceLogger("不支持 TLS 版本 < 3", 31, true)
+		c.logf(stagePreConnect, 31, true, "不支持 TLS 版本 < 3")
 		return ""
 	}
 
@@ -329,7 +380,7 @@ func getSNIServerName(buf []byte) string {
 
 	// 握手消息类型
 	if buf[5] != typeClientHello {
-		serviceLogger("不是 Client Hello 消息", 31, true)
+		c.logf(stagePreConnect, 31, true, "不是 Client Hello 消息")
 		return ""
 	}
 
@@ -338,60 +389,65 @@ func getSNIServerName(buf []byte) string {
 	// Client Hello 不包含 TLS 标头, 5 字节
 	ret := msg.unmarshal(buf[5:n])
 	if !ret {
-		serviceLogger("解析 Client Hello 消息失败", 31, true)
+		c.logf(stagePreConnect, 31, true, "解析 Client Hello 消息失败")
 		return ""
 	}
 	return msg.serverName
 }
 
-// forward 函数接收一个 net.Conn 类型的连接对象 conn、一个 []byte 类型的数据 data、一个目标地址 dst 和一个来源地址 raddr
+// forward 函数接收一个 net.Conn 类型的连接对象 conn、连接上下文 c、一个 []byte 类型的数据 data 和一个目标地址 dst
 // 该函数先解析 dst 得到全部候选 IP（DNS 对同一域名可能返回多个 A/AAAA 记录），
 // 再由 dialBackendRetry 按“上次连接结果”排序后依次尝试连接（开启 verify_tls 时会先用真实 TLS 握手验证候选 IP，
 // 验证失败/连接失败会在内部自动重试下一个 IP，对客户端透明，
 // 且每次结果都会记录下来，下次连接同一域名时优先使用上次成功的 IP），
 // 连接成功后将 data 写入 backend，然后使用 ioReflector 函数将 backend 和 conn 连接起来，以便将数据从一个连接转发到另一个连接
-func forward(conn net.Conn, data []byte, dst string, raddr string) {
+// 字节转发日志会带上实际连接的后端 IP 与该 IP 在候选列表中的序号（由 dialBackendRetry 返回的 backendResult 提供）
+func forward(conn net.Conn, c *connCtx, data []byte, dst string) {
 	// 从 host:port 中提取 host，后续用于 DNS 解析与 IP 比较
 	host, port, err := net.SplitHostPort(dst)
 	if err != nil {
-		serviceLogger(fmt.Sprintf("目标地址格式错误(HTTPS): \"%s\", %v", dst, err), 31, false)
+		c.logf(stagePreConnect, 31, false, "目标地址格式错误(HTTPS): \"%s\", %v", dst, err)
 		return
 	}
 
 	// 解析目标 host，拿到所有候选 IP（支持直接 IP 或域名）
 	ips, err := resolveHostIPs(host)
 	if err != nil {
-		serviceLogger(fmt.Sprintf("解析目标地址失败(HTTPS): \"%s\", %v", host, err), 31, false)
+		c.logf(stagePreConnect, 31, false, "解析目标地址失败(HTTPS): \"%s\", %v", host, err)
 		return
 	}
 
 	// 建立后端连接前先做安全检查，避免把流量再次传回本机导致死循环
-	if blocked, reason := shouldBlockForwardIPs(ips, raddr); blocked {
-		serviceLogger(fmt.Sprintf("拒绝转发(HTTPS): \"%s\", 目标: [%s], 来源: [%s]", reason, dst, raddr), 31, false)
+	if blocked, reason := shouldBlockForwardIPs(ips, c.srcAddr); blocked {
+		c.logf(stagePreConnect, 31, false, "拒绝转发(HTTPS): \"%s\", 目标: [%s], 来源: [%s]", reason, dst, c.srcAddr)
 		return
 	}
 
 	// 按历史结果排序后依次尝试连接所有候选 IP（内部自动重试）
-	backend, first := dialBackendRetry(host, port, ips, data)
-	if backend == nil {
-		serviceLogger(fmt.Sprintf("所有后端 IP 连接失败(HTTPS): [%s], 共尝试 %d 个", dst, len(ips)), 31, false)
+	res := dialBackendRetry(c, host, port, ips, data)
+	if res == nil {
+		c.logf(stagePreConnect, 31, false, "所有后端 IP 连接失败(HTTPS): [%s], 共尝试 %d 个", dst, len(ips))
 		return
 	}
+	backend := res.conn
 	defer backend.Close()
 
-	if len(first) > 0 { // 把等待首字节时提前读到的后端响应，先发回给客户端
-		if _, err := conn.Write(first); err != nil {
-			serviceLogger(fmt.Sprintf("无法传输到客户端(HTTPS), %v", err), 31, false)
+	// 连接后端已成功，后续日志进入 [已连] 阶段
+	if len(res.first) > 0 { // 把等待首字节时提前读到的后端响应，先发回给客户端
+		if _, err := conn.Write(res.first); err != nil {
+			c.logf(stageConnected, 31, false, "无法传输到客户端(HTTPS), %v", err)
 			return
 		}
+		c.logf(stageConnected, 33, true, "首包回写客户端: %d bytes", len(res.first))
 	}
 
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 
+	backendDesc := res.backendDesc(port) // 字节日志中展示实际后端 IP 与候选序号
 	conChk := make(chan struct{})
-	go ioReflector(ctx, backend, conn, false, conChk, raddr, dst)
-	go ioReflector(ctx, conn, backend, true, conChk, raddr, dst)
+	go ioReflector(ctx, backend, conn, false, conChk, c, backendDesc)
+	go ioReflector(ctx, conn, backend, true, conChk, c, backendDesc)
 	<-conChk
 	// 取消上下文，通知另一个 ioReflector 退出
 	cancel()
@@ -511,10 +567,11 @@ func isIPInList(target net.IP, list []net.IP) bool {
 	return false
 }
 
-// ioReflector 函数接收一个 io.WriteCloser 类型的写入对象 dst、一个 io.Reader 类型的读取对象 src、一个 bool 类型的 isToClient、一个 chan struct{} 类型的 conChk，以及两个字符串类型的 raddr 和 dsts
+// ioReflector 函数接收一个 io.WriteCloser 类型的写入对象 dst、一个 io.Reader 类型的读取对象 src、一个 bool 类型的 isToClient、
+// 一个 chan struct{} 类型的 conChk、连接上下文 c，以及字节日志中使用的后端描述 backendDesc（含实际后端 IP 与候选序号）
 // 该函数使用 io.Copy 函数将 src 中读取到的数据流复制到 dst 中，然后将转发的字节数写入日志
 // 最后，该函数关闭 dst 连接，并向 conChk 通道发送一个信号以表示连接已关闭。
-func ioReflector(ctx context.Context, dst io.WriteCloser, src io.Reader, isToClient bool, conChk chan struct{}, raddr string, dsts string) {
+func ioReflector(ctx context.Context, dst io.WriteCloser, src io.Reader, isToClient bool, conChk chan struct{}, c *connCtx, backendDesc string) {
 	// 将 IO 流反映到另一个
 	defer onDisconnect(dst, conChk)
 
@@ -522,9 +579,9 @@ func ioReflector(ctx context.Context, dst io.WriteCloser, src io.Reader, isToCli
 	go func() {
 		written, _ := io.Copy(dst, src)
 		if isToClient {
-			serviceLogger(fmt.Sprintf("[%v] -> [%v] %d bytes", dsts, raddr, written), 33, true)
+			c.logf(stageConnected, 33, true, "%s -> [%s] %d bytes", backendDesc, c.srcAddr, written)
 		} else {
-			serviceLogger(fmt.Sprintf("[%v] -> [%v] %d bytes", raddr, dsts, written), 33, true)
+			c.logf(stageConnected, 33, true, "[%s] -> %s %d bytes", c.srcAddr, backendDesc, written)
 		}
 		close(done)
 	}()

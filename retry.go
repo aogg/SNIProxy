@@ -346,6 +346,22 @@ func isValidServerHello(first []byte) bool {
 	return length >= 4 // 记录负载至少要容纳 4 字节的握手消息头，否则也是异常响应
 }
 
+// backendResult dialBackendRetry 的连接结果：
+// 除后端连接与提前读到的首包数据外，还携带“实际连接的后端 IP 及其序号”，
+// 供调用方（forward/ioReflector）在 [已连] 阶段的字节日志中展示实际后端信息
+type backendResult struct {
+	conn  net.Conn // 已建立的后端连接（dialBackendRetry 全部失败时返回 nil 结果）
+	first []byte   // 等待首字节时提前读到的后端响应（由调用方转发给客户端）
+	ip    net.IP   // 实际连接成功的后端 IP
+	index int      // 该 IP 在去重排序后候选列表中的位置（1-based，即拨号尝试顺序中的第几个）
+	total int      // 去重排序后的候选 IP 总数
+}
+
+// backendDesc 生成字节日志中使用的后端描述：后端[185.199.110.133:443 候选2/4]
+func (r *backendResult) backendDesc(port string) string {
+	return fmt.Sprintf("后端[%s 候选%d/%d]", net.JoinHostPort(r.ip.String(), port), r.index, r.total)
+}
+
 // dialBackendRetry 按“上次连接结果”排序后依次尝试连接 host 的所有候选 IP：
 //
 //	1.（TLS 验证开启时）先用真实 TLS 握手验证该 IP（结果缓存：成功 10 分钟、失败 60 秒）
@@ -357,10 +373,12 @@ func isValidServerHello(first []byte) bool {
 //
 // 整个重试过程都在 SNIProxy 内部完成，对客户端完全透明（此时还没有任何数据发给客户端）。
 // 每次尝试的结果都会记录到 dnsRetryCache，下次连接同一域名时按上次结果排序转发。
+// 过程中的所有日志都通过连接上下文 c 输出（带 [#ID 域名] 前缀与 [连前]/[已连] 阶段标记）。
 // 全部 IP 都失败时返回 nil。
-func dialBackendRetry(host, port string, ips []net.IP, data []byte) (net.Conn, []byte) {
-	ordered := dnsRetryCacheInstance.orderIPs(host, ips)
-	serviceLogger(fmt.Sprintf("候选IP顺序: %s -> [%s]", host, joinIPs(ordered)), 36, true)
+func dialBackendRetry(c *connCtx, host, port string, ips []net.IP, data []byte) *backendResult {
+	// 排序后再对最终候选列表做一次防御性去重，保证 “第 N 个候选” 的编号与 IP 一一对应、无重复
+	ordered := dedupeIPs(dnsRetryCacheInstance.orderIPs(host, ips))
+	c.logf(stagePreConnect, 36, true, "候选IP顺序(共%d): %s", len(ordered), joinIPs(ordered))
 
 	probeTimeout := verifyProbeTimeout() // 为 0 时表示不探测（verify_tls=false 等），完全保持旧行为
 
@@ -376,14 +394,14 @@ func dialBackendRetry(host, port string, ips []net.IP, data []byte) (net.Conn, [
 					// 验证失败按连接失败处理：记 fail、缓存失败结果，60 秒内不再探测该 IP
 					dnsRetryCacheInstance.setVerifyResult(host, ip.String(), false, err.Error())
 					dnsRetryCacheInstance.reportResult(host, ip.String(), false)
-					serviceLogger(fmt.Sprintf("后端验证失败%s: [%s], %v", attempt, addr, err), 31, false)
+					c.logf(stagePreConnect, 31, false, "后端验证失败%s: [%s], %v", attempt, addr, err)
 					continue
 				}
 				dnsRetryCacheInstance.setVerifyResult(host, ip.String(), true, "")
-				serviceLogger(fmt.Sprintf("后端验证通过%s: [%s]", attempt, addr), 32, false)
+				c.logf(stagePreConnect, 32, false, "后端验证通过%s: [%s]", attempt, addr)
 			} else if !r.ok {
 				// 60 秒内验证失败过的 IP 直接跳过，不再探测
-				serviceLogger(fmt.Sprintf("后端验证失败(缓存)%s: [%s], %s, 跳过", attempt, addr, r.reason), 31, true)
+				c.logf(stagePreConnect, 31, true, "后端验证失败(缓存)%s: [%s], %s, 跳过", attempt, addr, r.reason)
 				continue
 			}
 			// 验证通过（含 10 分钟内缓存命中），继续走下面的正常连接流程
@@ -392,14 +410,14 @@ func dialBackendRetry(host, port string, ips []net.IP, data []byte) (net.Conn, [
 		backend, err := dialWithTimeout("tcp", addr, cfg.DialTimeout)
 		if err != nil { // 连接失败，记录结果并自动重试下一个 IP
 			dnsRetryCacheInstance.reportResult(host, ip.String(), false)
-			serviceLogger(fmt.Sprintf("连接后端失败%s: [%s], %v", attempt, addr, err), 31, false)
+			c.logf(stagePreConnect, 31, false, "连接后端失败%s: [%s], %v", attempt, addr, err)
 			continue
 		}
 
 		if _, err := backend.Write(data); err != nil { // 发送握手数据失败，同样自动重试下一个 IP
 			backend.Close()
 			dnsRetryCacheInstance.reportResult(host, ip.String(), false)
-			serviceLogger(fmt.Sprintf("无法传输到后端%s: [%s], %v", attempt, addr, err), 31, false)
+			c.logf(stagePreConnect, 31, false, "无法传输到后端%s: [%s], %v", attempt, addr, err)
 			continue
 		}
 
@@ -408,7 +426,7 @@ func dialBackendRetry(host, port string, ips []net.IP, data []byte) (net.Conn, [
 		if !ok {
 			backend.Close()
 			dnsRetryCacheInstance.reportResult(host, ip.String(), false)
-			serviceLogger(fmt.Sprintf("后端无响应%s: [%s]", attempt, addr), 31, false)
+			c.logf(stagePreConnect, 31, false, "后端无响应%s: [%s]", attempt, addr)
 			continue
 		}
 
@@ -416,14 +434,14 @@ func dialBackendRetry(host, port string, ips []net.IP, data []byte) (net.Conn, [
 		if probeTimeout > 0 && !isValidServerHello(first) {
 			backend.Close()
 			dnsRetryCacheInstance.reportResult(host, ip.String(), false)
-			serviceLogger(fmt.Sprintf("后端响应异常%s: [%s], 不是合法的 TLS ServerHello 记录", attempt, addr), 31, false)
+			c.logf(stagePreConnect, 31, false, "后端响应异常%s: [%s], 不是合法的 TLS ServerHello 记录", attempt, addr)
 			continue
 		}
 
-		// 连接成功，记录结果，下次优先使用该 IP
+		// 连接成功，记录结果，下次优先使用该 IP（连接成功及之后的日志进入 [已连] 阶段）
 		dnsRetryCacheInstance.reportResult(host, ip.String(), true)
-		serviceLogger(fmt.Sprintf("连接后端成功%s: [%s]", attempt, addr), 32, false)
-		return backend, first
+		c.logf(stageConnected, 32, false, "连接后端成功%s: [%s]", attempt, addr)
+		return &backendResult{conn: backend, first: first, ip: ip, index: i + 1, total: len(ordered)}
 	}
-	return nil, nil
+	return nil
 }
