@@ -326,13 +326,10 @@ func TestDialBackendRetry_VerifyRejectsPlainBackend(t *testing.T) {
 	port := strconv.Itoa(ln.Addr().(*net.TCPAddr).Port)
 
 	host := "verify-reject.invalid"
-	backend, first := dialBackendRetry(host, port, []net.IP{net.ParseIP("127.0.0.1")}, []byte("data"))
-	if backend != nil {
-		backend.Close()
+	res := dialBackendRetry(newConnCtx("127.0.0.1:1234"), host, port, []net.IP{net.ParseIP("127.0.0.1")}, []byte("data"))
+	if res != nil {
+		res.conn.Close()
 		t.Fatal("开启 verify_tls 时明文后端应被 TLS 验证拒绝")
-	}
-	if first != nil {
-		t.Fatal("被验证拒绝的后端不应有首字节响应")
 	}
 	if r := dnsRetryCacheInstance.verify[host]["127.0.0.1"]; r == nil || r.ok {
 		t.Fatalf("验证失败结果应写入缓存, got %+v", r)
