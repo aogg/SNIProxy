@@ -26,3 +26,7 @@ SNIProxy
 # 本地运行日志与本地测试配置（不入库）
 *.log
 config.local.yaml
+
+# 本地运行时产物目录（二进制、日志等，不入库）
+runtimes/
+*.exe.old
