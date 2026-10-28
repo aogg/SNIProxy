@@ -151,43 +151,101 @@ func (p *fakeHTTPProxy) connectAuth(n int) string {
 
 // ---------- env 代理解析（parseEnvHTTPProxy） ----------
 
-// parseEnvHTTPProxy 按优先级取第一个非空值：HTTPS_PROXY → https_proxy → HTTP_PROXY → http_proxy → ALL_PROXY → all_proxy；
-// 空白值视为未设置继续往下；无 scheme 视为 http:// 且 port 缺省 80；非 http scheme 或解析失败时返回 nil（等效未配置）
+// parseEnvHTTPProxy 按优先级取第一个非空值：AGAIN_PROXY → again_proxy（旧 6 变量链 HTTPS_PROXY/HTTP_PROXY/ALL_PROXY
+// 及其小写不再被识别，命中即返回 nil）；空白值视为未设置继续往下；无 scheme 视为 http:// 且 port 缺省 80；
+// 非 http scheme 或解析失败时返回 nil（等效未配置），且不再尝试低优先级变量
 func TestParseEnvHTTPProxy(t *testing.T) {
 	cases := []struct {
 		name string
 		envs map[string]string
 		want *httpProxyAddr
 	}{
-		{"优先级取HTTPS_PROXY", map[string]string{
-			"HTTPS_PROXY": "10.0.0.1:8843", "https_proxy": "10.0.0.2:8843",
-			"HTTP_PROXY": "10.0.0.3:8843", "ALL_PROXY": "10.0.0.5:8843",
-		}, &httpProxyAddr{Name: "HTTPS_PROXY", Host: "10.0.0.1", Port: "8843"}},
-		{"次级取https_proxy", map[string]string{
-			"https_proxy": "10.0.0.2:8843", "HTTP_PROXY": "10.0.0.3:8843",
-		}, &httpProxyAddr{Name: "https_proxy", Host: "10.0.0.2", Port: "8843"}},
-		{"空白值视为未设置继续往下", map[string]string{
-			"HTTPS_PROXY": "", "https_proxy": "   ", "HTTP_PROXY": "10.0.0.3:8843",
-		}, &httpProxyAddr{Name: "HTTP_PROXY", Host: "10.0.0.3", Port: "8843"}},
-		{"小写all_proxy兜底", map[string]string{"all_proxy": "10.0.0.6:8843"},
-			&httpProxyAddr{Name: "all_proxy", Host: "10.0.0.6", Port: "8843"}},
-		{"无scheme缺省端口80", map[string]string{"HTTP_PROXY": "1.2.3.4"},
-			&httpProxyAddr{Name: "HTTP_PROXY", Host: "1.2.3.4", Port: "80"}},
-		{"无scheme带userinfo缺省端口80", map[string]string{"HTTP_PROXY": "user:pass@1.2.3.4"},
-			&httpProxyAddr{Name: "HTTP_PROXY", Host: "1.2.3.4", Port: "80", User: "user", Pass: "pass"}},
-		{"scheme大小写不敏感", map[string]string{"HTTP_PROXY": "HTTP://user:pass@1.2.3.4:8080"},
-			&httpProxyAddr{Name: "HTTP_PROXY", Host: "1.2.3.4", Port: "8080", User: "user", Pass: "pass"}},
-		{"全部未设置返回nil", map[string]string{}, nil},
-		{"非http scheme返回nil且不再尝试低优先级", map[string]string{
-			"HTTPS_PROXY": "socks5://10.0.0.1:1080", "HTTP_PROXY": "10.0.0.9:80",
+		{"优先级取AGAIN_PROXY", map[string]string{
+			"AGAIN_PROXY": "10.0.0.1:8843", "again_proxy": "10.0.0.2:8843",
+		}, &httpProxyAddr{Name: "AGAIN_PROXY", Host: "10.0.0.1", Port: "8843"}},
+		{"次级取again_proxy", map[string]string{
+			"again_proxy": "10.0.0.2:8843",
+		}, &httpProxyAddr{Name: "again_proxy", Host: "10.0.0.2", Port: "8843"}},
+		{"大写空白视为未设置继续往下", map[string]string{
+			"AGAIN_PROXY": "", "again_proxy": "10.0.0.6:8843",
+		}, &httpProxyAddr{Name: "again_proxy", Host: "10.0.0.6", Port: "8843"}},
+		{"全部空白视为未设置返回nil", map[string]string{
+			"AGAIN_PROXY": "  ", "again_proxy": "   ",
 		}, nil},
-		{"缺少主机地址返回nil", map[string]string{"HTTP_PROXY": "http://"}, nil},
-		{"端口非法解析失败返回nil", map[string]string{"HTTP_PROXY": "http://1.2.3.4:abc"}, nil},
+		{"无scheme缺省端口80", map[string]string{"AGAIN_PROXY": "1.2.3.4"},
+			&httpProxyAddr{Name: "AGAIN_PROXY", Host: "1.2.3.4", Port: "80"}},
+		{"无scheme带userinfo缺省端口80", map[string]string{"AGAIN_PROXY": "user:pass@1.2.3.4"},
+			&httpProxyAddr{Name: "AGAIN_PROXY", Host: "1.2.3.4", Port: "80", User: "user", Pass: "pass"}},
+		{"scheme大小写不敏感", map[string]string{"AGAIN_PROXY": "HTTP://user:pass@1.2.3.4:8080"},
+			&httpProxyAddr{Name: "AGAIN_PROXY", Host: "1.2.3.4", Port: "8080", User: "user", Pass: "pass"}},
+		{"全部未设置返回nil", map[string]string{}, nil},
+		{"旧6变量链不再被识别返回nil", map[string]string{
+			"HTTPS_PROXY": "10.0.0.1:8843", "https_proxy": "10.0.0.2:8843",
+			"HTTP_PROXY": "10.0.0.3:8843", "http_proxy": "10.0.0.4:8843",
+			"ALL_PROXY": "10.0.0.5:8843", "all_proxy": "10.0.0.6:8843",
+		}, nil},
+		{"非http scheme返回nil且不再尝试低优先级", map[string]string{
+			"AGAIN_PROXY": "socks5://10.0.0.1:1080", "again_proxy": "10.0.0.9:80",
+		}, nil},
+		{"缺少主机地址返回nil", map[string]string{"AGAIN_PROXY": "http://"}, nil},
+		{"端口非法解析失败返回nil", map[string]string{"AGAIN_PROXY": "http://1.2.3.4:abc"}, nil},
 	}
 	for _, c := range cases {
 		t.Run(c.name, func(t *testing.T) {
 			setEnvProxyLookup(t, c.envs)
 			got := parseEnvHTTPProxy()
+			if (c.want == nil) != (got == nil) {
+				t.Fatalf("解析结果 = %v, 期望 %v", got, c.want)
+			}
+			if got != nil && *got != *c.want {
+				t.Fatalf("解析结果 = %+v, 期望 %+v", *got, *c.want)
+			}
+		})
+	}
+}
+
+// ---------- AGAIN_PROXY 代理来源解析（resolveAgainProxy） ----------
+
+// resolveAgainProxy 来源优先级：环境变量 AGAIN_PROXY/again_proxy（先大写后小写）优先，
+// env 未设置或值非法被忽略时再用 config.yaml 的 again_proxy（cfgValue）；
+// 两者都未配置或值非法时返回 nil（等同未配置代理，回退轮询关闭）。
+// Name 为实际命中的变量名；config 来源固定为 configAgainProxyName 标签。
+func TestResolveAgainProxy(t *testing.T) {
+	cases := []struct {
+		name     string
+		envs     map[string]string
+		cfgValue string
+		want     *httpProxyAddr
+	}{
+		{"env大写命中优先且压住config", map[string]string{
+			"AGAIN_PROXY": "10.0.0.1:8843", "again_proxy": "10.0.0.2:8843",
+		}, "10.9.9.9:8080",
+			&httpProxyAddr{Name: "AGAIN_PROXY", Host: "10.0.0.1", Port: "8843"}},
+		{"env小写命中优先于config", map[string]string{
+			"again_proxy": "10.0.0.2:8843",
+		}, "10.9.9.9:8080",
+			&httpProxyAddr{Name: "again_proxy", Host: "10.0.0.2", Port: "8843"}},
+		{"env未设置用config兜底", map[string]string{},
+			"10.9.9.9:8080",
+			&httpProxyAddr{Name: configAgainProxyName, Host: "10.9.9.9", Port: "8080"}},
+		{"env值非法只忽略不阻断落到config", map[string]string{
+			"AGAIN_PROXY": "socks5://10.0.0.1:1080",
+		}, "10.9.9.9:8080",
+			&httpProxyAddr{Name: configAgainProxyName, Host: "10.9.9.9", Port: "8080"}},
+		{"env未设置且config非法返回nil", map[string]string{},
+			"socks5://10.9.9.9:1080", nil},
+		{"env未设置且config纯空返回nil", map[string]string{},
+			"", nil},
+		{"env未设置且config空白返回nil", map[string]string{},
+			"   ", nil},
+		{"env与config都非法返回nil", map[string]string{
+			"AGAIN_PROXY": "socks5://10.0.0.1:1080",
+		}, "socks5://10.9.9.9:1080", nil},
+	}
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			setEnvProxyLookup(t, c.envs) // 注入 env 查询，t.Cleanup 自动恢复
+			got := resolveAgainProxy(c.cfgValue)
 			if (c.want == nil) != (got == nil) {
 				t.Fatalf("解析结果 = %v, 期望 %v", got, c.want)
 			}
