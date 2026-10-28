@@ -242,17 +242,22 @@ func joinIPs(ips []net.IP) string {
 	return strings.Join(strs, ", ")
 }
 
-// dialWithTimeout 带超时的拨号（直连、Socks5 前置代理均支持），单位：秒
-func dialWithTimeout(network, addr string, timeoutSec int) (net.Conn, error) {
-	d := GetDialer(cfg.EnableSocks)
+// dialWithDialer 使用指定拨号器带超时拨号（单位：秒），超时通过 ContextDialer 的 context deadline 实现
+// （第 1 轮传直连/SOCKS5 拨号器，代理轮询传 httpProxyDialer）
+func dialWithDialer(d proxy.Dialer, network, addr string, timeoutSec int) (net.Conn, error) {
 	if timeoutSec > 0 {
-		if cd, ok := d.(proxy.ContextDialer); ok { // 直连(*net.Dialer)和 SOCKS5 拨号器都实现了 DialContext
+		if cd, ok := d.(proxy.ContextDialer); ok { // 直连(*net.Dialer)、SOCKS5 与 HTTP 代理拨号器都实现了 DialContext
 			ctx, cancel := context.WithTimeout(context.Background(), time.Duration(timeoutSec)*time.Second)
 			defer cancel()
 			return cd.DialContext(ctx, network, addr)
 		}
 	}
 	return d.Dial(network, addr)
+}
+
+// dialWithTimeout 带超时的拨号（直连、Socks5 前置代理均支持），单位：秒
+func dialWithTimeout(network, addr string, timeoutSec int) (net.Conn, error) {
+	return dialWithDialer(GetDialer(cfg.EnableSocks), network, addr, timeoutSec)
 }
 
 // isVerifyTLSEnabled 返回是否启用后端真实 TLS 验证（verify_tls 未配置时默认开启）
@@ -275,12 +280,18 @@ func verifyProbeTimeout() int {
 // 握手成功（含证书校验通过）才认为该 IP 可用，返回 nil；否则返回具体失败原因。
 // 整个探测（拨号 + 握手）受 timeoutSec 秒的总超时限制，超时同样视为验证失败。
 func verifyBackend(addr, host string, timeoutSec int) error {
+	return verifyBackendWithDialer(GetDialer(cfg.EnableSocks), addr, host, timeoutSec)
+}
+
+// verifyBackendWithDialer 与 verifyBackend 相同的探测逻辑，但使用指定的拨号器
+// （代理轮询时传 httpProxyDialer，探测握手也经代理拨号，探测总超时同样受 timeoutSec 秒约束）。
+func verifyBackendWithDialer(d proxy.Dialer, addr, host string, timeoutSec int) error {
 	if timeoutSec <= 0 {
 		return nil // 配置为不探测（调用方不会以 0 调用，此处仅兜底，视为通过）
 	}
 	deadline := time.Now().Add(time.Duration(timeoutSec) * time.Second)
 
-	backend, err := dialWithTimeout("tcp", addr, timeoutSec)
+	backend, err := dialWithDialer(d, "tcp", addr, timeoutSec)
 	if err != nil {
 		return fmt.Errorf("拨号失败: %v", err)
 	}
@@ -350,11 +361,12 @@ func isValidServerHello(first []byte) bool {
 // 除后端连接与提前读到的首包数据外，还携带“实际连接的后端 IP 及其序号”，
 // 供调用方（forward/ioReflector）在 [已连] 阶段的字节日志中展示实际后端信息
 type backendResult struct {
-	conn  net.Conn // 已建立的后端连接（dialBackendRetry 全部失败时返回 nil 结果）
-	first []byte   // 等待首字节时提前读到的后端响应（由调用方转发给客户端）
-	ip    net.IP   // 实际连接成功的后端 IP
-	index int      // 该 IP 在去重排序后候选列表中的位置（1-based，即拨号尝试顺序中的第几个）
-	total int      // 去重排序后的候选 IP 总数
+	conn     net.Conn // 已建立的后端连接（dialBackendRetry 全部失败时返回 nil 结果）
+	first    []byte   // 等待首字节时提前读到的后端响应（由调用方转发给客户端）
+	ip       net.IP   // 实际连接成功的后端 IP
+	index    int      // 该 IP 在去重排序后候选列表中的位置（1-based，即拨号尝试顺序中的第几个）
+	total    int      // 去重排序后的候选 IP 总数
+	viaProxy bool     // 是否经环境变量 HTTP 代理轮询连上（仅用于标记来源，backendDesc 输出格式保持不变）
 }
 
 // backendDesc 生成字节日志中使用的后端描述：后端[185.199.110.133:443 候选2/4]
@@ -371,10 +383,15 @@ func (r *backendResult) backendDesc(port string) string {
 //	4. 连接成功但等待后端响应超时     -> 自动重试下一个 IP
 //	5. 连接成功但首个响应不是合法的 TLS ServerHello 记录 -> 按连接失败处理，自动重试下一个 IP
 //
-// 整个重试过程都在 SNIProxy 内部完成，对客户端完全透明（此时还没有任何数据发给客户端）。
-// 每次尝试的结果都会记录到 dnsRetryCache，下次连接同一域名时按上次结果排序转发。
-// 过程中的所有日志都通过连接上下文 c 输出（带 [#ID 域名] 前缀与 [连前]/[已连] 阶段标记）。
-// 全部 IP 都失败时返回 nil。
+// 上述单 IP 尝试会轮询两轮（对客户端完全透明，此时还没有任何数据发给客户端）：
+//   - 第 1 轮：现有行为（直连或 Socks5 前置），每个 IP 的结果都会记录到 dnsRetryCache；
+//   - 第 2 轮（仅当第 1 轮全部失败且检测到环境变量 HTTP 代理时）：对同一个排序后的候选列表
+//     按同一顺序经代理再完整轮询一轮（探测握手也经代理拨号），
+//     该轮的一切结果都不写入 dnsRetryCache，避免污染直连排序语义。
+//
+// 过程中的所有日志都通过连接上下文 c 输出（带 [#ID 域名] 前缀与 [连前]/[已连] 阶段标记），
+// 代理轮询内的尝试日志带 “(代理)” 标记与第 1 轮区分。
+// 两轮全部失败时返回 nil。
 func dialBackendRetry(c *connCtx, host, port string, ips []net.IP, data []byte) *backendResult {
 	// 排序后再对最终候选列表做一次防御性去重，保证 “第 N 个候选” 的编号与 IP 一一对应、无重复
 	ordered := dedupeIPs(dnsRetryCacheInstance.orderIPs(host, ips))
@@ -382,42 +399,82 @@ func dialBackendRetry(c *connCtx, host, port string, ips []net.IP, data []byte) 
 
 	probeTimeout := verifyProbeTimeout() // 为 0 时表示不探测（verify_tls=false 等），完全保持旧行为
 
+	// 第 1 轮：直连或 Socks5 前置（GetDialer(cfg.EnableSocks)），结果写入 dnsRetryCache
+	if res := dialBackendRound(c, host, port, ordered, data, GetDialer(cfg.EnableSocks), probeTimeout, "", true); res != nil {
+		return res
+	}
+
+	// 未检测到环境变量 HTTP 代理时到此为止（保持原有失败路径，零改动行为）
+	if envHTTPProxy == nil {
+		return nil
+	}
+
+	// 第 2 轮：环境变量 HTTP 代理回退轮询。
+	// 必须复用第 1 轮最终的 ordered 列表的同一顺序（不得重新排序、去重或打乱），候选序号 (i/N) 按同一列表
+	c.logf(stagePreConnect, 33, false, "直连轮询全部失败(共%d个), 开始环境变量代理轮询", len(ordered))
+	proxyDialer := newHTTPProxyDialer(envHTTPProxy) // 连代理本身是直连 TCP（cfg.EnableSocks 只影响第 1 轮）
+	return dialBackendRound(c, host, port, ordered, data, proxyDialer, probeTimeout, "(代理)", false)
+}
+
+// dialBackendRound dialBackendRetry 的单轮实现：按给定顺序对候选列表完整轮询一轮，
+// 每个 IP 的尝试步骤（TLS 验证探测 -> 拨号 -> 写握手数据 -> 等首字节 -> ServerHello 校验）保持一致，
+// 任一步失败自动尝试下一个 IP，全部失败返回 nil。
+//
+//	d          本轮使用的拨号器（第 1 轮为 GetDialer(cfg.EnableSocks)，代理轮询为 httpProxyDialer）
+//	roundTag   日志标记（第 1 轮为 ""，代理轮询为 "(代理)"，插入在日志内容与候选序号之间以区分两轮）
+//	report     是否把每个 IP 的结果写入 dnsRetryCache（代理轮询必须传 false，避免污染直连排序语义）
+func dialBackendRound(c *connCtx, host, port string, ordered []net.IP, data []byte, d proxy.Dialer, probeTimeout int, roundTag string, report bool) *backendResult {
+	// 结果记录统一入口：代理轮询（report=false）不写缓存，stats 与 verify 缓存都不受影响
+	record := func(ip net.IP, success bool) {
+		if report {
+			dnsRetryCacheInstance.reportResult(host, ip.String(), success)
+		}
+	}
+
 	for i, ip := range ordered {
 		addr := net.JoinHostPort(ip.String(), port)
 		attempt := fmt.Sprintf("(%d/%d)", i+1, len(ordered))
 
 		// 后端真实 TLS 验证：候选 IP 必须通过一次真实 TLS 握手（含完整证书校验）才算可用
 		if probeTimeout > 0 {
-			if r, hit := dnsRetryCacheInstance.getVerifyResult(host, ip.String()); !hit {
-				// 未验证过（或缓存已过期）：先探测再连接
-				if err := verifyBackend(addr, host, probeTimeout); err != nil {
-					// 验证失败按连接失败处理：记 fail、缓存失败结果，60 秒内不再探测该 IP
-					dnsRetryCacheInstance.setVerifyResult(host, ip.String(), false, err.Error())
-					dnsRetryCacheInstance.reportResult(host, ip.String(), false)
-					c.logf(stagePreConnect, 31, false, "后端验证失败%s: [%s], %v", attempt, addr, err)
+			if report { // 第 1 轮：探测结果读写缓存（成功 10 分钟内复用、失败 60 秒内直接跳过）
+				if r, hit := dnsRetryCacheInstance.getVerifyResult(host, ip.String()); !hit {
+					// 未验证过（或缓存已过期）：先探测再连接
+					if err := verifyBackendWithDialer(d, addr, host, probeTimeout); err != nil {
+						// 验证失败按连接失败处理：记 fail、缓存失败结果，60 秒内不再探测该 IP
+						dnsRetryCacheInstance.setVerifyResult(host, ip.String(), false, err.Error())
+						record(ip, false)
+						c.logf(stagePreConnect, 31, false, "后端验证失败%s%s: [%s], %v", roundTag, attempt, addr, err)
+						continue
+					}
+					dnsRetryCacheInstance.setVerifyResult(host, ip.String(), true, "")
+					c.logf(stagePreConnect, 32, false, "后端验证通过%s%s: [%s]", roundTag, attempt, addr)
+				} else if !r.ok {
+					// 60 秒内验证失败过的 IP 直接跳过，不再探测
+					c.logf(stagePreConnect, 31, true, "后端验证失败(缓存)%s%s: [%s], %s, 跳过", roundTag, attempt, addr, r.reason)
 					continue
 				}
-				dnsRetryCacheInstance.setVerifyResult(host, ip.String(), true, "")
-				c.logf(stagePreConnect, 32, false, "后端验证通过%s: [%s]", attempt, addr)
-			} else if !r.ok {
-				// 60 秒内验证失败过的 IP 直接跳过，不再探测
-				c.logf(stagePreConnect, 31, true, "后端验证失败(缓存)%s: [%s], %s, 跳过", attempt, addr, r.reason)
-				continue
+				// 验证通过（含 10 分钟内缓存命中），继续走下面的正常连接流程
+			} else { // 代理轮询：探测握手经代理拨号，结果不读写验证缓存（代理链路的可用性与直连无关）
+				if err := verifyBackendWithDialer(d, addr, host, probeTimeout); err != nil {
+					c.logf(stagePreConnect, 31, false, "后端验证失败%s%s: [%s], %v", roundTag, attempt, addr, err)
+					continue
+				}
+				c.logf(stagePreConnect, 32, false, "后端验证通过%s%s: [%s]", roundTag, attempt, addr)
 			}
-			// 验证通过（含 10 分钟内缓存命中），继续走下面的正常连接流程
 		}
 
-		backend, err := dialWithTimeout("tcp", addr, cfg.DialTimeout)
+		backend, err := dialWithDialer(d, "tcp", addr, cfg.DialTimeout)
 		if err != nil { // 连接失败，记录结果并自动重试下一个 IP
-			dnsRetryCacheInstance.reportResult(host, ip.String(), false)
-			c.logf(stagePreConnect, 31, false, "连接后端失败%s: [%s], %v", attempt, addr, err)
+			record(ip, false)
+			c.logf(stagePreConnect, 31, false, "连接后端失败%s%s: [%s], %v", roundTag, attempt, addr, err)
 			continue
 		}
 
 		if _, err := backend.Write(data); err != nil { // 发送握手数据失败，同样自动重试下一个 IP
 			backend.Close()
-			dnsRetryCacheInstance.reportResult(host, ip.String(), false)
-			c.logf(stagePreConnect, 31, false, "无法传输到后端%s: [%s], %v", attempt, addr, err)
+			record(ip, false)
+			c.logf(stagePreConnect, 31, false, "无法传输到后端%s%s: [%s], %v", roundTag, attempt, addr, err)
 			continue
 		}
 
@@ -425,23 +482,23 @@ func dialBackendRetry(c *connCtx, host, port string, ips []net.IP, data []byte) 
 		first, ok := peekFirstByte(backend, cfg.FirstByteTimeout)
 		if !ok {
 			backend.Close()
-			dnsRetryCacheInstance.reportResult(host, ip.String(), false)
-			c.logf(stagePreConnect, 31, false, "后端无响应%s: [%s]", attempt, addr)
+			record(ip, false)
+			c.logf(stagePreConnect, 31, false, "后端无响应%s%s: [%s]", roundTag, attempt, addr)
 			continue
 		}
 
 		// 校验首个响应是不是合法的 TLS 握手记录（识别“回了数据但不是正常 TLS 服务”的坏 IP）
 		if probeTimeout > 0 && !isValidServerHello(first) {
 			backend.Close()
-			dnsRetryCacheInstance.reportResult(host, ip.String(), false)
-			c.logf(stagePreConnect, 31, false, "后端响应异常%s: [%s], 不是合法的 TLS ServerHello 记录", attempt, addr)
+			record(ip, false)
+			c.logf(stagePreConnect, 31, false, "后端响应异常%s%s: [%s], 不是合法的 TLS ServerHello 记录", roundTag, attempt, addr)
 			continue
 		}
 
 		// 连接成功，记录结果，下次优先使用该 IP（连接成功及之后的日志进入 [已连] 阶段）
-		dnsRetryCacheInstance.reportResult(host, ip.String(), true)
-		c.logf(stageConnected, 32, false, "连接后端成功%s: [%s]", attempt, addr)
-		return &backendResult{conn: backend, first: first, ip: ip, index: i + 1, total: len(ordered)}
+		record(ip, true)
+		c.logf(stageConnected, 32, false, "连接后端成功%s%s: [%s]", roundTag, attempt, addr)
+		return &backendResult{conn: backend, first: first, ip: ip, index: i + 1, total: len(ordered), viaProxy: roundTag != ""}
 	}
 	return nil
 }

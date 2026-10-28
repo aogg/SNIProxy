@@ -11,6 +11,14 @@ listen_addr: ":443"
 #socks_username: admin
 #socks_password: abc123
 
+# 可选：环境变量 HTTP 代理（没有配置文件配置项，只能通过环境变量设置，不做 NO_PROXY 支持）
+# 变量按优先级取第一个非空值：HTTPS_PROXY > https_proxy > HTTP_PROXY > http_proxy > ALL_PROXY > all_proxy
+# 值仅支持 http:// 前缀或省略 scheme（省略视为 http://），支持 user:pass@host[:port]（CONNECT 时加认证头），端口缺省 80，例如：
+#   HTTPS_PROXY=http://127.0.0.1:8080
+#   HTTPS_PROXY=user:pass@1.2.3.4
+# 行为：仅当第 1 轮（直连或 Socks5 前置）逐 IP 轮询全部失败后，才会用该 HTTP 代理对同一候选 IP 列表按同一顺序再轮询一轮（回退），
+# 代理轮询的结果不会写入内部排序缓存；其他 scheme（如 socks5://）或解析失败会在启动日志 warn 一条后忽略（等同未设置）
+
 # 可选：DNS 对同一域名返回多个 IP 时，连接失败会在内部自动重试下一个 IP（以下为默认值，单位：秒）
 #dial_timeout: 5       # 连接单个后端 IP 的超时时间，超时后自动尝试下一个 IP
 #first_byte_timeout: 5 # 连接后等待后端响应第一个字节的超时时间，超时说明该 IP 已假死，自动尝试下一个 IP

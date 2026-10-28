@@ -158,6 +158,15 @@ func main() {
 	}
 	serviceLogger(fmt.Sprintf("DNS重试: 开启 (连接超时: %d秒, 首字节超时: %d秒, TLS验证: %s)", cfg.DialTimeout, cfg.FirstByteTimeout, verifyState), 32, false)
 
+	// 环境变量 HTTP 代理：启动时解析一次（HTTPS_PROXY → https_proxy → HTTP_PROXY → http_proxy → ALL_PROXY → all_proxy），
+	// 仅作为“直连轮询全部失败后”的回退出口（解析规则与回退行为详见 httpproxy.go）
+	envHTTPProxy = parseEnvHTTPProxy()
+	if envHTTPProxy == nil {
+		serviceLogger("环境变量代理: 未检测到", 32, false)
+	} else {
+		serviceLogger(fmt.Sprintf("环境变量代理: 开启 (%s=%s, 直连全败后回退轮询)", envHTTPProxy.Name, envHTTPProxy.maskedURL()), 32, false)
+	}
+
 	startSniProxy() // 启动 SNI Proxy
 }
 
