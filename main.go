@@ -86,6 +86,7 @@ type configModel struct {
 	DialTimeout      int      `yaml:"dial_timeout,omitempty"`       // 连接单个后端 IP 的超时时间（秒）
 	FirstByteTimeout int      `yaml:"first_byte_timeout,omitempty"` // 等待后端响应第一个字节的超时时间（秒）
 	VerifyTLS        *bool    `yaml:"verify_tls,omitempty"`         // 连接前是否用真实 TLS 握手验证候选 IP（指针是为了区分“未配置”，未配置时默认开启）
+	AgainProxy       string   `yaml:"again_proxy,omitempty"`        // AGAIN_PROXY HTTP 回退代理（环境变量 AGAIN_PROXY 未设置或值非法时使用，值格式同环境变量）
 }
 
 func init() {
@@ -158,13 +159,15 @@ func main() {
 	}
 	serviceLogger(fmt.Sprintf("DNS重试: 开启 (连接超时: %d秒, 首字节超时: %d秒, TLS验证: %s)", cfg.DialTimeout, cfg.FirstByteTimeout, verifyState), 32, false)
 
-	// 环境变量 HTTP 代理：启动时解析一次（HTTPS_PROXY → https_proxy → HTTP_PROXY → http_proxy → ALL_PROXY → all_proxy），
+	// AGAIN_PROXY HTTP 代理：启动时解析一次（环境变量 AGAIN_PROXY/again_proxy 优先，未设置或值非法时再用 config.yaml 的 again_proxy），
 	// 仅作为“直连轮询全部失败后”的回退出口（解析规则与回退行为详见 httpproxy.go）
-	envHTTPProxy = parseEnvHTTPProxy()
+	envHTTPProxy = resolveAgainProxy(cfg.AgainProxy)
 	if envHTTPProxy == nil {
-		serviceLogger("环境变量代理: 未检测到", 32, false)
+		serviceLogger("AGAIN_PROXY: 未检测到", 32, false)
+	} else if envHTTPProxy.Name == configAgainProxyName {
+		serviceLogger(fmt.Sprintf("AGAIN_PROXY: 开启 (来源: config.yaml again_proxy, %s)", envHTTPProxy.maskedURL()), 32, false)
 	} else {
-		serviceLogger(fmt.Sprintf("环境变量代理: 开启 (%s=%s, 直连全败后回退轮询)", envHTTPProxy.Name, envHTTPProxy.maskedURL()), 32, false)
+		serviceLogger(fmt.Sprintf("AGAIN_PROXY: 开启 (来源: 环境变量 %s, %s)", envHTTPProxy.Name, envHTTPProxy.maskedURL()), 32, false)
 	}
 
 	startSniProxy() // 启动 SNI Proxy

@@ -13,29 +13,33 @@ import (
 	"golang.org/x/net/proxy"
 )
 
-// 环境变量 HTTP 代理（仅作为“直连轮询全部失败后”的回退出口）：
-//   1. 启动时按优先级取第一个非空的代理环境变量（HTTPS_PROXY → https_proxy → HTTP_PROXY → http_proxy → ALL_PROXY → all_proxy）；
+// AGAIN_PROXY HTTP 回退代理（仅作为“直连轮询全部失败后”的回退出口）：
+//   1. 来源优先级：环境变量 AGAIN_PROXY/again_proxy（先大写后小写，取第一个非空值）优先，
+//      env 未设置（或值非法被忽略）时再用 config.yaml 的 again_proxy；两者都无效 = 未配置代理（回退轮询关闭）；
 //   2. 值仅接受 http:// 或无 scheme（无 scheme 视为 http://），支持 user:pass@host[:port]（CONNECT 时加 Proxy-Authorization: Basic），port 缺省 80；
-//   3. 其他 scheme（如 socks5://）或解析失败：启动日志 warn 一条后忽略（等同无 env 代理），不影响正常运行；
+//   3. 其他 scheme（如 socks5://）或解析失败：启动日志 warn 一条后忽略（等同未配置），不影响正常运行；
 //   4. 代理轮询对“第一轮排序后的同一个候选列表”按同一顺序再完整轮询一轮，结果不写入 dnsRetryCache。
-// 说明：不做 NO_PROXY 支持；cfg.EnableSocks（Socks5 前置）只影响第一轮，连 HTTP 代理本身始终是直连 TCP。
+// 说明：不做 NO_PROXY 支持，也不再支持 HTTPS_PROXY/HTTP_PROXY/ALL_PROXY 等其他代理环境变量；
+// cfg.EnableSocks（Socks5 前置）只影响第一轮，连 HTTP 代理本身始终是直连 TCP。
 
-// envProxyNames 依次探测的代理环境变量（按优先级从高到低，取第一个非空值）
+// configAgainProxyName config.yaml again_proxy 来源在 httpProxyAddr.Name 中的固定标签
+const configAgainProxyName = "config again_proxy"
+
+// envProxyNames 依次探测的 AGAIN_PROXY 环境变量（先大写后小写，取第一个非空值；不再支持其他代理环境变量）
 var envProxyNames = []string{
-	"HTTPS_PROXY", "https_proxy",
-	"HTTP_PROXY", "http_proxy",
-	"ALL_PROXY", "all_proxy",
+	"AGAIN_PROXY", "again_proxy",
 }
 
 // envProxyLookup 可注入的环境变量查询函数（默认 os.LookupEnv，便于将来单元测试）
 var envProxyLookup = os.LookupEnv
 
-// envHTTPProxy 启动时解析到的环境变量 HTTP 代理（未检测到、或值非法被忽略时为 nil）
+// envHTTPProxy 启动时解析到的 AGAIN_PROXY HTTP 代理（env 优先，其次 config.yaml again_proxy；
+// 两者都未配置或值非法被忽略时为 nil，即回退轮询关闭）
 var envHTTPProxy *httpProxyAddr
 
-// httpProxyAddr 解析后的环境变量 HTTP 代理地址
+// httpProxyAddr 解析后的 AGAIN_PROXY HTTP 代理地址
 type httpProxyAddr struct {
-	Name string // 实际命中的环境变量名（如 HTTPS_PROXY，用于启动日志）
+	Name string // 来源标签（如 "AGAIN_PROXY" / "config again_proxy"，用于启动日志区分来源）
 	Host string // 代理主机
 	Port string // 代理端口（未填写时缺省 80）
 	User string // 认证用户名（可空）
@@ -76,8 +80,31 @@ func parseEnvHTTPProxy() *httpProxyAddr {
 	return nil
 }
 
-// parseHTTPProxyValue 解析单个环境变量的值：仅接受 http:// 或无 scheme（无 scheme 视为 http://），
-// 支持 user:pass@host[:port]（port 缺省 80）；其他 scheme 或格式非法时返回错误。
+// resolveAgainProxy 解析 AGAIN_PROXY 代理的最终来源（启动时调用一次）：
+// 环境变量（AGAIN_PROXY/again_proxy，先大写后小写）优先，env 未设置（或值非法被忽略）时
+// 再用 config.yaml 的 again_proxy（cfgValue）；两者都未配置或值非法时返回 nil，
+// 即“未配置代理”，回退轮询关闭（行为与无代理时完全一致）。
+func resolveAgainProxy(cfgValue string) *httpProxyAddr {
+	// 1. 环境变量优先：命中即用（env 值非法时 parseEnvHTTPProxy 内部已 warn 并返回 nil，此处继续尝试 config）
+	if p := parseEnvHTTPProxy(); p != nil {
+		return p
+	}
+	// 2. config.yaml again_proxy 兜底：未填写则视为未配置；值非法时 warn 一条后按未配置处理
+	cfgValue = strings.TrimSpace(cfgValue)
+	if cfgValue == "" {
+		return nil
+	}
+	p, err := parseHTTPProxyValue(configAgainProxyName, cfgValue)
+	if err != nil {
+		serviceLogger(fmt.Sprintf("AGAIN_PROXY: config.yaml again_proxy=%s 的值无法使用(%v), 已忽略, 等同未配置", maskProxyRaw(cfgValue), err), 33, false)
+		return nil
+	}
+	return p
+}
+
+// parseHTTPProxyValue 解析单个代理值（AGAIN_PROXY 环境变量值或 config.yaml again_proxy 值，name 传入来源标签）：
+// 仅接受 http:// 或无 scheme（无 scheme 视为 http://），支持 user:pass@host[:port]（port 缺省 80）；
+// 其他 scheme 或格式非法时返回错误。
 func parseHTTPProxyValue(name, raw string) (*httpProxyAddr, error) {
 	val := raw
 	if !strings.Contains(strings.ToLower(val), "://") {
@@ -125,14 +152,14 @@ var (
 	_ proxy.ContextDialer = (*httpProxyDialer)(nil)
 )
 
-// httpProxyDialer 通过环境变量指定的 HTTP 代理建立 CONNECT 隧道的拨号器
+// httpProxyDialer 通过 AGAIN_PROXY 指定的 HTTP 代理建立 CONNECT 隧道的拨号器
 // （手写 HTTP CONNECT，不引入新依赖；连代理本身始终是直连 TCP，不受 Socks5 前置影响）
 type httpProxyDialer struct {
 	addr string // 代理地址 host:port
 	auth string // Base64 编码的 Proxy-Authorization 值（无认证信息时为空）
 }
 
-// newHTTPProxyDialer 根据解析后的环境变量代理构造拨号器
+// newHTTPProxyDialer 根据解析后的 AGAIN_PROXY 代理构造拨号器
 func newHTTPProxyDialer(p *httpProxyAddr) *httpProxyDialer {
 	d := &httpProxyDialer{addr: p.addr()}
 	if p.User != "" || p.Pass != "" { // 支持账号密码认证（CONNECT 时加 Proxy-Authorization 头）

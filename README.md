@@ -24,7 +24,7 @@ SNIProxy 是一个根据传入的域名(SNI)来自动转发数据至该域名源
 
 - **支持** 全平台、全系统（Go 语言特性）
 - **支持** Socks5 前置代理（比如可以再套一层 WARP，这样 SNIProxy 的出口 IP 就是 Cloudflare 的了）
-- **支持** 通过环境变量指定 HTTP 代理（`HTTPS_PROXY` 等），直连轮询全部失败后自动回退经该代理再轮询一轮
+- **支持** AGAIN_PROXY HTTP 回退代理（环境变量 `AGAIN_PROXY` 或配置文件 `again_proxy`，环境变量优先），直连轮询全部失败后自动回退经该代理再轮询一轮
 - **支持** 允许转发所有域名  或 仅允许转发指定域名（包含域名自身及其所有子域名）
 - **支持** 单独或同时监听及传输 IPv4、IPv6 流量
 - **支持** 将 HTTP 重定向为 HTTPS
@@ -285,15 +285,22 @@ rules:
 
 ****
 
-#### \# 环境变量 HTTP 代理（回退出口）
+#### \# AGAIN_PROXY HTTP 代理（回退出口）
 
-除配置文件外，还可以用环境变量指定一个 **HTTP 代理** 作为回退出口（没有配置文件配置项）：
+支持用 **AGAIN_PROXY** 指定一个 **HTTP 代理** 作为回退出口，来源优先级：**环境变量 > 配置文件**（环境变量未设置或值非法被忽略时，才用配置文件的 `again_proxy`）。
+
+来源一：环境变量（先大写 `AGAIN_PROXY` 后小写 `again_proxy`，取第一个非空值；不再支持 `HTTPS_PROXY`/`HTTP_PROXY`/`ALL_PROXY` 等其他代理环境变量）：
+
+```sh
+# 仅支持 http:// 前缀或省略 scheme（省略视为 http://），支持账号密码，端口缺省 80
+AGAIN_PROXY=http://192.168.1.1:8899
+AGAIN_PROXY=user:pass@1.2.3.4
+```
+
+来源二：配置文件（`config.yaml`，值格式与环境变量相同）：
 
 ```yaml
-# 按优先级取第一个非空值：HTTPS_PROXY > https_proxy > HTTP_PROXY > http_proxy > ALL_PROXY > all_proxy
-# 仅支持 http:// 前缀或省略 scheme（省略视为 http://），支持账号密码，端口缺省 80
-HTTPS_PROXY=http://127.0.0.1:8080
-HTTPS_PROXY=user:pass@1.2.3.4
+again_proxy: http://192.168.1.1:8899
 ```
 
 行为说明：
@@ -301,7 +308,7 @@ HTTPS_PROXY=user:pass@1.2.3.4
 1. 第 1 轮仍为原有行为（直连或 Socks5 前置，逐候选 IP 轮询），并正常记录每个 IP 的连接结果；
 2. 仅当**第 1 轮全部失败**后，才会用该 HTTP 代理对**同一候选 IP 列表**（同一顺序）再完整轮询一轮（TLS 验证探测、首字节、ServerHello 校验等步骤照做）；
 3. 代理轮询的结果**不会写入**内部排序缓存（不影响直连时的 IP 排序），两轮都失败才算最终失败；
-4. 其他 scheme（如 `socks5://`）或解析失败会在启动日志中 warn 一条后忽略（等同未设置），启动时也会输出一行环境变量代理状态（userinfo 会打码）；不支持 NO_PROXY。
+4. 两个来源都未设置（或值非法被忽略）= 未配置代理，回退轮询关闭（行为与无代理时完全一致）；其他 scheme（如 `socks5://`）或解析失败会在启动日志中 warn 一条后忽略（等同未设置），启动时也会输出一行 AGAIN_PROXY 状态（userinfo 会打码，来源标明环境变量或 config.yaml）；不支持 NO_PROXY。
 
 ****
 
