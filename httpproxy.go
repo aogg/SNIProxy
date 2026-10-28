@@ -72,7 +72,7 @@ func parseEnvHTTPProxy() *httpProxyAddr {
 		}
 		p, err := parseHTTPProxyValue(name, strings.TrimSpace(val))
 		if err != nil {
-			serviceLogger(fmt.Sprintf("环境变量代理: %s=%s 的值无法使用(%v), 已忽略, 等同未配置", name, maskProxyRaw(val), err), 33, false)
+			serviceLogger(fmt.Sprintf("AGAIN_PROXY: %s=%s 的值无法使用(%v), 已忽略, 等同未配置", name, maskProxyRaw(val), err), 33, false)
 			return nil
 		}
 		return p
