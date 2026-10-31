@@ -33,6 +33,8 @@ var (
 const (
 	stagePreConnect = "连前" // 尚未与后端建立可用连接的阶段（连接来自/握手/SNI/白名单/DNS/安全拒绝/TLS验证/连接重试等）
 	stageConnected  = "已连" // 已成功连接后端及之后的阶段（连接后端成功/首包回写客户端/双向转发字节数等）
+	stageTransfer   = "传输" // 双向转发阶段的传输监视日志（进度/停滞检测）
+	stageClose      = "结束" // 连接结束总结日志（结束原因/总时长/双向字节）
 )
 
 // connIDSeq 全局连接 ID 计数器（Accept 到连接时原子自增，从 1 开始）
@@ -41,9 +43,10 @@ var connIDSeq int64
 // connCtx 连接上下文：在 Accept 到连接时创建，贯穿该连接整个生命周期，
 // 用于给所有连接级日志统一加上 “连接 ID + 域名 + 阶段” 前缀，方便区分是哪个连接、哪个域名发出的请求
 type connCtx struct {
-	id      int64  // 连接 ID（全局唯一，从 1 开始递增，日志中显示为 #<id>）
-	srcAddr string // 客户端来源地址（host:port）
-	host    string // 域名（解析出 SNI/Host 之前为 "-" 占位）
+	id      int64     // 连接 ID（全局唯一，从 1 开始递增，日志中显示为 #<id>）
+	srcAddr string    // 客户端来源地址（host:port）
+	host    string    // 域名（解析出 SNI/Host 之前为 "-" 占位）
+	start   time.Time // 连接开始时间（Accept 时赋值，用于各阶段耗时与结束总结的总时长）
 }
 
 // newConnCtx 创建连接上下文（在 Accept 到连接时调用，为连接分配全局唯一 ID）
@@ -52,6 +55,7 @@ func newConnCtx(srcAddr string) *connCtx {
 		id:      atomic.AddInt64(&connIDSeq, 1),
 		srcAddr: srcAddr,
 		host:    "-",
+		start:   time.Now(),
 	}
 }
 
@@ -87,6 +91,8 @@ type configModel struct {
 	FirstByteTimeout int      `yaml:"first_byte_timeout,omitempty"` // 等待后端响应第一个字节的超时时间（秒）
 	VerifyTLS        *bool    `yaml:"verify_tls,omitempty"`         // 连接前是否用真实 TLS 握手验证候选 IP（指针是为了区分“未配置”，未配置时默认开启）
 	AgainProxy       string   `yaml:"again_proxy,omitempty"`        // AGAIN_PROXY HTTP 回退代理（环境变量 AGAIN_PROXY 未设置或值非法时使用，值格式同环境变量）
+	ProgressInterval *int     `yaml:"progress_interval,omitempty"`  // 传输进度日志间隔秒（指针是为了区分“未配置”，未配置时默认 10；显式 0=关闭进度日志）
+	StallTimeout     *int     `yaml:"stall_timeout,omitempty"`      // 停滞判定秒（指针是为了区分“未配置”，未配置时默认 30；显式 0=关闭停滞检测）
 }
 
 func init() {
@@ -158,6 +164,15 @@ func main() {
 		verifyState = fmt.Sprintf("开启, 探测超时: %d秒", cfg.FirstByteTimeout)
 	}
 	serviceLogger(fmt.Sprintf("DNS重试: 开启 (连接超时: %d秒, 首字节超时: %d秒, TLS验证: %s)", cfg.DialTimeout, cfg.FirstByteTimeout, verifyState), 32, false)
+
+	// 传输进度/停滞检测：未配置时填充默认值（显式 0=关闭，负数与 0 同义按关闭处理）
+	cfg.ProgressInterval = normalizeTransferInterval(cfg.ProgressInterval, defaultProgressInterval)
+	cfg.StallTimeout = normalizeTransferInterval(cfg.StallTimeout, defaultStallTimeout)
+	if *cfg.ProgressInterval <= 0 && *cfg.StallTimeout <= 0 {
+		serviceLogger("传输日志: 已关闭 (↑=客户端→后端, ↓=后端→客户端)", 32, false)
+	} else {
+		serviceLogger(fmt.Sprintf("传输日志: 进度间隔 %ds, 停滞判定 %ds (↑=客户端→后端, ↓=后端→客户端)", *cfg.ProgressInterval, *cfg.StallTimeout), 32, false)
+	}
 
 	// AGAIN_PROXY HTTP 代理：启动时解析一次（环境变量 AGAIN_PROXY/again_proxy 优先，未设置或值非法时再用 config.yaml 的 again_proxy），
 	// 仅作为“直连轮询全部失败后”的回退出口（解析规则与回退行为详见 httpproxy.go）
@@ -423,11 +438,13 @@ func forward(conn net.Conn, c *connCtx, data []byte, dst string) {
 	}
 
 	// 解析目标 host，拿到所有候选 IP（支持直接 IP 或域名）
+	dnsStart := time.Now()
 	ips, err := resolveHostIPs(host)
 	if err != nil {
 		c.logf(stagePreConnect, 31, false, "解析目标地址失败(HTTPS): \"%s\", %v", host, err)
 		return
 	}
+	c.logf(stagePreConnect, 32, false, "DNS解析完成: %d 个IP, 耗时 %v", len(ips), time.Since(dnsStart))
 
 	// 建立后端连接前先做安全检查，避免把流量再次传回本机导致死循环
 	if blocked, reason := shouldBlockForwardIPs(ips, c.srcAddr); blocked {
@@ -445,12 +462,16 @@ func forward(conn net.Conn, c *connCtx, data []byte, dst string) {
 	defer backend.Close()
 
 	// 连接后端已成功，后续日志进入 [已连] 阶段
+	ts := newTransferStats()      // 双向字节计数与最后活动时间（传输监视与结束总结共用）
+	closeInfo := &transferClose{} // 先结束方向的结束原因（仅第一次保存生效）
+
 	if len(res.first) > 0 { // 把等待首字节时提前读到的后端响应，先发回给客户端
 		if _, err := conn.Write(res.first); err != nil {
 			c.logf(stageConnected, 31, false, "无法传输到客户端(HTTPS), %v", err)
 			return
 		}
-		c.logf(stageConnected, 33, true, "首包回写客户端%s: %d bytes", res.pathTag(), len(res.first))
+		ts.addDown(int64(len(res.first))) // 首包回写的字节数手动计入 ↓ 后端→客户端 计数器
+		c.logf(stageConnected, 33, true, "首包回写客户端%s: %d bytes, 距连接开始 %v", res.pathTag(), len(res.first), time.Since(c.start))
 	}
 
 	ctx, cancel := context.WithCancel(context.Background())
@@ -458,11 +479,21 @@ func forward(conn net.Conn, c *connCtx, data []byte, dst string) {
 
 	backendDesc := res.backendDesc(port) // 字节日志中展示实际后端 IP 与候选序号
 	conChk := make(chan struct{})
-	go ioReflector(ctx, backend, conn, false, conChk, c, backendDesc)
-	go ioReflector(ctx, conn, backend, true, conChk, c, backendDesc)
+	go ioReflector(ctx, backend, conn, false, conChk, c, backendDesc, ts, closeInfo)
+	go ioReflector(ctx, conn, backend, true, conChk, c, backendDesc, ts, closeInfo)
+	startTransferWatcher(ctx, c, backendDesc, ts, c.start) // 传输监视：进度/停滞日志，随 ctx 退出
 	<-conChk
 	// 取消上下文，通知另一个 ioReflector 退出
 	cancel()
+
+	// 连接结束总结（非 debug 必出）：先结束方向的原因 + 总时长 + 双向累计字节（正常断开绿色 32，带 error 红色 31）
+	reason := closeInfo.get()
+	color := 32 // 正常断开：绿色
+	if reason.isError {
+		color = 31 // 异常结束（带 error）：红色
+	}
+	c.logf(stageClose, color, false, "%s: 总时长 %v, ↑%s ↓%s, %s",
+		reason.text, time.Since(c.start).Truncate(time.Second), humanBytes(ts.up()), humanBytes(ts.down()), backendDesc)
 }
 
 // shouldBlockForwardIPs 在建立后端连接前判断目标 IP 列表是否有问题（DNS 解析由调用方完成，避免重复解析）
@@ -580,16 +611,20 @@ func isIPInList(target net.IP, list []net.IP) bool {
 }
 
 // ioReflector 函数接收一个 io.WriteCloser 类型的写入对象 dst、一个 io.Reader 类型的读取对象 src、一个 bool 类型的 isToClient、
-// 一个 chan struct{} 类型的 conChk、连接上下文 c，以及字节日志中使用的后端描述 backendDesc（含实际后端 IP、候选序号与出口路径标签）
-// 该函数使用 io.Copy 函数将 src 中读取到的数据流复制到 dst 中，然后将转发的字节数写入日志
-// 最后，该函数关闭 dst 连接，并向 conChk 通道发送一个信号以表示连接已关闭。
-func ioReflector(ctx context.Context, dst io.WriteCloser, src io.Reader, isToClient bool, conChk chan struct{}, c *connCtx, backendDesc string) {
+// 一个 chan struct{} 类型的 conChk、连接上下文 c、字节日志中使用的后端描述 backendDesc、
+// 双向字节计数器 ts 与先结束方向的结束原因记录 closeInfo
+// 该函数将 src 中读取到的数据流复制到 dst 中（手写拷贝循环 reflectorCopy，用于区分读/写错误并统计双向字节），
+// 然后将结束原因保存到 closeInfo（仅先结束的方向生效），最后关闭 dst 连接，并向 conChk 通道发送一个信号以表示连接已关闭。
+func ioReflector(ctx context.Context, dst io.WriteCloser, src io.Reader, isToClient bool, conChk chan struct{}, c *connCtx, backendDesc string, ts *transferStats, closeInfo *transferClose) {
 	// 将 IO 流反映到另一个
 	defer onDisconnect(dst, conChk)
 
 	done := make(chan struct{})
 	go func() {
-		written, _ := io.Copy(dst, src)
+		// 手写拷贝循环：分别记录读/写错误并统计双向字节
+		written, reason := reflectorCopy(dst, src, ts, isToClient)
+		// 保存结束原因（仅先结束的方向生效）
+		closeInfo.save(reason)
 		if isToClient {
 			c.logf(stageConnected, 33, true, "%s -> [%s] %d bytes", backendDesc, c.srcAddr, written)
 		} else {

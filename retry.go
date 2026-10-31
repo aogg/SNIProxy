@@ -491,10 +491,12 @@ func dialBackendRound(c *connCtx, host, port string, ordered []net.IP, data []by
 			}
 		}
 
+		dialStart := time.Now()
 		backend, err := dialWithDialer(d, "tcp", addr, cfg.DialTimeout)
-		if err != nil { // 连接失败，记录结果并自动重试下一个 IP
+		dialElapsed := time.Since(dialStart) // 本次拨号耗时（成功/失败日志都会带上）
+		if err != nil {                      // 连接失败，记录结果并自动重试下一个 IP
 			record(ip, false)
-			c.logf(stagePreConnect, 31, false, "连接后端失败%s%s: [%s], %v", roundTag, attempt, addr, err)
+			c.logf(stagePreConnect, 31, false, "连接后端失败%s%s: [%s], %v, 耗时 %v", roundTag, attempt, addr, err, dialElapsed)
 			continue
 		}
 
@@ -524,7 +526,7 @@ func dialBackendRound(c *connCtx, host, port string, ordered []net.IP, data []by
 
 		// 连接成功，记录结果，下次优先使用该 IP（连接成功及之后的日志进入 [已连] 阶段）
 		record(ip, true)
-		c.logf(stageConnected, 32, false, "连接后端成功%s%s: [%s]", roundTag, attempt, addr)
+		c.logf(stageConnected, 32, false, "连接后端成功%s%s: [%s], 耗时 %v", roundTag, attempt, addr, dialElapsed)
 		return &backendResult{conn: backend, first: first, ip: ip, index: i + 1, total: len(ordered), viaProxy: roundTag == pathTagAgainProxy}
 	}
 	return nil
