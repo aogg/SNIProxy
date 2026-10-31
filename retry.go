@@ -357,6 +357,22 @@ func isValidServerHello(first []byte) bool {
 	return length >= 4 // 记录负载至少要容纳 4 字节的握手消息头，否则也是异常响应
 }
 
+// 出口路径日志标签：从“出口路径确定”起的每条日志（拨号尝试与 [已连] 阶段）都携带，
+// 用于区分该连接实际走的出口（AGAIN_PROXY 命名与启动日志 “AGAIN_PROXY: 开启” 保持一致）
+const (
+	pathTagDirect     = "(直连)"        // 第 1 轮：直连出口（cfg.EnableSocks=false）
+	pathTagSocks5     = "(socks5)"      // 第 1 轮：Socks5 前置代理出口（cfg.EnableSocks=true，不误标成直连）
+	pathTagAgainProxy = "(AGAIN_PROXY)" // 第 2 轮：AGAIN_PROXY 代理回退出口
+)
+
+// round1Tag 返回第 1 轮的出口路径标签：cfg.EnableSocks 开启时第 1 轮实为 Socks5 前置，标签用 (socks5)，否则为 (直连)
+func round1Tag() string {
+	if cfg.EnableSocks {
+		return pathTagSocks5
+	}
+	return pathTagDirect
+}
+
 // backendResult dialBackendRetry 的连接结果：
 // 除后端连接与提前读到的首包数据外，还携带“实际连接的后端 IP 及其序号”，
 // 供调用方（forward/ioReflector）在 [已连] 阶段的字节日志中展示实际后端信息
@@ -366,12 +382,23 @@ type backendResult struct {
 	ip       net.IP   // 实际连接成功的后端 IP
 	index    int      // 该 IP 在去重排序后候选列表中的位置（1-based，即拨号尝试顺序中的第几个）
 	total    int      // 去重排序后的候选 IP 总数
-	viaProxy bool     // 是否经 AGAIN_PROXY 代理轮询连上（仅用于标记来源，backendDesc 输出格式保持不变）
+	viaProxy bool     // 是否经 AGAIN_PROXY 代理轮询连上（配合 cfg.EnableSocks 推导出口路径标签，见 pathTag）
 }
 
-// backendDesc 生成字节日志中使用的后端描述：后端[185.199.110.133:443 候选2/4]
+// pathTag 返回该连接实际出口路径的日志标签（出口路径标签的单一来源）：
+// 经第 2 轮 AGAIN_PROXY 代理连上时为 (AGAIN_PROXY)，否则按 cfg.EnableSocks 区分 (socks5)/(直连)。
+// [已连] 阶段日志（首包回写客户端、双向字节数等）统一从这里取标签，与拨号阶段的 roundTag 同源一致
+func (r *backendResult) pathTag() string {
+	if r.viaProxy {
+		return pathTagAgainProxy
+	}
+	return round1Tag()
+}
+
+// backendDesc 生成字节日志中使用的后端描述：后端[185.199.110.133:443 候选2/4](直连)
+// （出口路径标签由 pathTag 提供，追加在方括号之后）
 func (r *backendResult) backendDesc(port string) string {
-	return fmt.Sprintf("后端[%s 候选%d/%d]", net.JoinHostPort(r.ip.String(), port), r.index, r.total)
+	return fmt.Sprintf("后端[%s 候选%d/%d]%s", net.JoinHostPort(r.ip.String(), port), r.index, r.total, r.pathTag())
 }
 
 // dialBackendRetry 按“上次连接结果”排序后依次尝试连接 host 的所有候选 IP：
@@ -390,7 +417,7 @@ func (r *backendResult) backendDesc(port string) string {
 //     该轮的一切结果都不写入 dnsRetryCache，避免污染直连排序语义。
 //
 // 过程中的所有日志都通过连接上下文 c 输出（带 [#ID 域名] 前缀与 [连前]/[已连] 阶段标记），
-// 代理轮询内的尝试日志带 “(代理)” 标记与第 1 轮区分。
+// 且每条日志都带出口路径标签：第 1 轮为 “(直连)”/“(socks5)”（按 cfg.EnableSocks），第 2 轮为 “(AGAIN_PROXY)”。
 // 两轮全部失败时返回 nil。
 func dialBackendRetry(c *connCtx, host, port string, ips []net.IP, data []byte) *backendResult {
 	// 排序后再对最终候选列表做一次防御性去重，保证 “第 N 个候选” 的编号与 IP 一一对应、无重复
@@ -399,8 +426,8 @@ func dialBackendRetry(c *connCtx, host, port string, ips []net.IP, data []byte) 
 
 	probeTimeout := verifyProbeTimeout() // 为 0 时表示不探测（verify_tls=false 等），完全保持旧行为
 
-	// 第 1 轮：直连或 Socks5 前置（GetDialer(cfg.EnableSocks)），结果写入 dnsRetryCache
-	if res := dialBackendRound(c, host, port, ordered, data, GetDialer(cfg.EnableSocks), probeTimeout, "", true); res != nil {
+	// 第 1 轮：直连或 Socks5 前置（GetDialer(cfg.EnableSocks)），结果写入 dnsRetryCache（出口路径标签按 cfg.EnableSocks 取 直连/socks5）
+	if res := dialBackendRound(c, host, port, ordered, data, GetDialer(cfg.EnableSocks), probeTimeout, round1Tag(), true); res != nil {
 		return res
 	}
 
@@ -413,7 +440,7 @@ func dialBackendRetry(c *connCtx, host, port string, ips []net.IP, data []byte) 
 	// 必须复用第 1 轮最终的 ordered 列表的同一顺序（不得重新排序、去重或打乱），候选序号 (i/N) 按同一列表
 	c.logf(stagePreConnect, 33, false, "直连轮询全部失败(共%d个), 开始 AGAIN_PROXY 代理轮询", len(ordered))
 	proxyDialer := newHTTPProxyDialer(envHTTPProxy) // 连代理本身是直连 TCP（cfg.EnableSocks 只影响第 1 轮）
-	return dialBackendRound(c, host, port, ordered, data, proxyDialer, probeTimeout, "(代理)", false)
+	return dialBackendRound(c, host, port, ordered, data, proxyDialer, probeTimeout, pathTagAgainProxy, false)
 }
 
 // dialBackendRound dialBackendRetry 的单轮实现：按给定顺序对候选列表完整轮询一轮，
@@ -421,7 +448,7 @@ func dialBackendRetry(c *connCtx, host, port string, ips []net.IP, data []byte) 
 // 任一步失败自动尝试下一个 IP，全部失败返回 nil。
 //
 //	d          本轮使用的拨号器（第 1 轮为 GetDialer(cfg.EnableSocks)，代理轮询为 httpProxyDialer）
-//	roundTag   日志标记（第 1 轮为 ""，代理轮询为 "(代理)"，插入在日志内容与候选序号之间以区分两轮）
+//	roundTag   出口路径日志标签（第 1 轮为 "(直连)"/"(socks5)"，第 2 轮为 "(AGAIN_PROXY)"，插入在日志内容与候选序号之间以区分出口路径）
 //	report     是否把每个 IP 的结果写入 dnsRetryCache（代理轮询必须传 false，避免污染直连排序语义）
 func dialBackendRound(c *connCtx, host, port string, ordered []net.IP, data []byte, d proxy.Dialer, probeTimeout int, roundTag string, report bool) *backendResult {
 	// 结果记录统一入口：代理轮询（report=false）不写缓存，stats 与 verify 缓存都不受影响
@@ -498,7 +525,7 @@ func dialBackendRound(c *connCtx, host, port string, ordered []net.IP, data []by
 		// 连接成功，记录结果，下次优先使用该 IP（连接成功及之后的日志进入 [已连] 阶段）
 		record(ip, true)
 		c.logf(stageConnected, 32, false, "连接后端成功%s%s: [%s]", roundTag, attempt, addr)
-		return &backendResult{conn: backend, first: first, ip: ip, index: i + 1, total: len(ordered), viaProxy: roundTag != ""}
+		return &backendResult{conn: backend, first: first, ip: ip, index: i + 1, total: len(ordered), viaProxy: roundTag == pathTagAgainProxy}
 	}
 	return nil
 }

@@ -413,7 +413,7 @@ func getSNIServerName(buf []byte, c *connCtx) string {
 // 验证失败/连接失败会在内部自动重试下一个 IP，对客户端透明，
 // 且每次结果都会记录下来，下次连接同一域名时优先使用上次成功的 IP），
 // 连接成功后将 data 写入 backend，然后使用 ioReflector 函数将 backend 和 conn 连接起来，以便将数据从一个连接转发到另一个连接
-// 字节转发日志会带上实际连接的后端 IP 与该 IP 在候选列表中的序号（由 dialBackendRetry 返回的 backendResult 提供）
+// 字节转发日志会带上实际连接的后端 IP、该 IP 在候选列表中的序号与出口路径标签（由 dialBackendRetry 返回的 backendResult 提供）
 func forward(conn net.Conn, c *connCtx, data []byte, dst string) {
 	// 从 host:port 中提取 host，后续用于 DNS 解析与 IP 比较
 	host, port, err := net.SplitHostPort(dst)
@@ -450,7 +450,7 @@ func forward(conn net.Conn, c *connCtx, data []byte, dst string) {
 			c.logf(stageConnected, 31, false, "无法传输到客户端(HTTPS), %v", err)
 			return
 		}
-		c.logf(stageConnected, 33, true, "首包回写客户端: %d bytes", len(res.first))
+		c.logf(stageConnected, 33, true, "首包回写客户端%s: %d bytes", res.pathTag(), len(res.first))
 	}
 
 	ctx, cancel := context.WithCancel(context.Background())
@@ -580,7 +580,7 @@ func isIPInList(target net.IP, list []net.IP) bool {
 }
 
 // ioReflector 函数接收一个 io.WriteCloser 类型的写入对象 dst、一个 io.Reader 类型的读取对象 src、一个 bool 类型的 isToClient、
-// 一个 chan struct{} 类型的 conChk、连接上下文 c，以及字节日志中使用的后端描述 backendDesc（含实际后端 IP 与候选序号）
+// 一个 chan struct{} 类型的 conChk、连接上下文 c，以及字节日志中使用的后端描述 backendDesc（含实际后端 IP、候选序号与出口路径标签）
 // 该函数使用 io.Copy 函数将 src 中读取到的数据流复制到 dst 中，然后将转发的字节数写入日志
 // 最后，该函数关闭 dst 连接，并向 conChk 通道发送一个信号以表示连接已关闭。
 func ioReflector(ctx context.Context, dst io.WriteCloser, src io.Reader, isToClient bool, conChk chan struct{}, c *connCtx, backendDesc string) {
