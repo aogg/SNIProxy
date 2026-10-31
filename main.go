@@ -3,6 +3,7 @@ package main
 import (
 	"context"
 	"encoding/binary"
+	"encoding/hex"
 	"flag"
 	"fmt"
 	"io"
@@ -31,10 +32,11 @@ var (
 
 // 连接级日志的阶段标记：区分日志发生在“连接后端成功前”还是“成功后”
 const (
-	stagePreConnect = "连前" // 尚未与后端建立可用连接的阶段（连接来自/握手/SNI/白名单/DNS/安全拒绝/TLS验证/连接重试等）
-	stageConnected  = "已连" // 已成功连接后端及之后的阶段（连接后端成功/首包回写客户端/双向转发字节数等）
-	stageTransfer   = "传输" // 双向转发阶段的传输监视日志（进度/停滞检测）
-	stageClose      = "结束" // 连接结束总结日志（结束原因/总时长/双向字节）
+	stagePreConnect = "连前"   // 尚未与后端建立可用连接的阶段（连接来自/握手/SNI/白名单/DNS/安全拒绝/TLS验证/连接重试等）
+	stageConnected  = "已连"   // 已成功连接后端及之后的阶段（连接后端成功/首包回写客户端/双向转发字节数等）
+	stageTransfer   = "传输"   // 双向转发阶段的传输监视日志（进度/停滞检测）
+	stageClose      = "结束"   // 连接结束总结日志（结束原因/总时长/双向字节）
+	stageSniffFail  = "嗅探失败" // 嗅探失败/无域名连接的关闭日志（非TLS数据、无SNI等，非 debug 必出）
 )
 
 // connIDSeq 全局连接 ID 计数器（Accept 到连接时原子自增，从 1 开始）
@@ -75,6 +77,52 @@ func (c *connCtx) prefix() string {
 // 颜色/debug/写文件逻辑复用 serviceLogger，各日志行的级别与颜色语义保持不变
 func (c *connCtx) logf(stage string, color int, isDebug bool, format string, v ...interface{}) {
 	serviceLogger(c.prefix()+" ["+stage+"] "+fmt.Sprintf(format, v...), color, isDebug)
+}
+
+// logSniffFail 输出嗅探失败/无域名连接的关闭日志（非 debug 必出）：关闭原因 + 首字节安全预览 + 关闭动作，
+// 让 "SSH-2.0-..." 这类非 TLS 流量在生产日志里一眼可辨（此前这些关闭点大多仅 debug 可见，线上表现为“悄无声息”）
+func logSniffFail(c *connCtx, reason string, data []byte) {
+	c.logf(stageSniffFail, 31, false, "%s 首字节:%s → 关闭连接", reason, safePreview(data, 64))
+}
+
+// safePreview 生成首字节的安全预览：可打印 ASCII 原样显示，控制字符/非 ASCII 转义为 \xHH，
+// 最多取前 max 字节（超出以 " ..." 结尾），末尾附前 32 字节的 hex，便于辨认 SSH 等非 TLS 协议
+func safePreview(data []byte, max int) string {
+	// ////////////////  校验参数  start  ////////////////////////////////////////////////
+	if len(data) == 0 {
+		return `"" (空)`
+	}
+	preview := data
+	if len(preview) > max {
+		preview = preview[:max]
+	}
+	// ////////////////  校验参数  end ////////////////////////////////////////////////
+	// ////////////////  核心逻辑  start  ////////////////////////////////////////////////
+	var text strings.Builder
+	for _, by := range preview {
+		if by >= 0x20 && by <= 0x7E { // 可打印 ASCII 原样显示
+			text.WriteByte(by)
+		} else { // 控制字符等转义为 \xHH
+			fmt.Fprintf(&text, "\\x%02X", by)
+		}
+	}
+	if len(preview) < len(data) {
+		text.WriteString(" ...")
+	}
+	hexPart := preview
+	if len(hexPart) > 32 { // hex 摘要最多取前 32 字节，避免日志过长
+		hexPart = hexPart[:32]
+	}
+	// ////////////////  核心逻辑  end ////////////////////////////////////////////////
+	// ////////////////  返回  start  ////////////////////////////////////////////////
+	return fmt.Sprintf("\"%s\" (hex: %s)", text.String(), hex.EncodeToString(hexPart))
+	// ////////////////  返回  end ////////////////////////////////////////////////
+}
+
+// isTLSRecordHeader 判断数据开头是否符合 TLS 记录层特征（记录类型 20-23 且主版本号为 3），
+// 用于在等待完整握手前快速辨认 SSH 等永远解析不出 SNI 的非 TLS 流量
+func isTLSRecordHeader(data []byte) bool {
+	return len(data) >= 2 && data[0] >= 20 && data[0] <= 23 && data[1] == 3
 }
 
 // 配置文件结构
@@ -214,7 +262,7 @@ func startSniProxy() {
 				}
 				raddr := conn.RemoteAddr().(*net.TCPAddr)
 				c := newConnCtx(raddr.String()) // 为连接分配全局唯一 ID
-				c.logf(stagePreConnect, 32, false, "连接来自: [%s]", c.srcAddr)
+				c.logf(stagePreConnect, 32, false, "连接来自: [%s] 监听端口: [%d]", c.srcAddr, conn.LocalAddr().(*net.TCPAddr).Port)
 				go handleHTTPRedirect(conn, c) // 有新连接进来，启动一个新线程处理
 			}
 		}(listenerHTTP)
@@ -238,7 +286,7 @@ func startSniProxy() {
 			}
 			raddr := conn.RemoteAddr().(*net.TCPAddr)
 			c := newConnCtx(raddr.String()) // 为连接分配全局唯一 ID
-			c.logf(stagePreConnect, 32, false, "连接来自: [%s]", c.srcAddr)
+			c.logf(stagePreConnect, 32, false, "连接来自: [%s] 监听端口: [%d]", c.srcAddr, conn.LocalAddr().(*net.TCPAddr).Port)
 			go serve(conn, c) // 有新连接进来，启动一个新线程处理
 		}
 	}(listener)
@@ -263,13 +311,13 @@ func handleHTTPRedirect(conn net.Conn, c *connCtx) {
 	data := string(buf[:n])
 	lines := strings.Split(data, "\r\n")
 	if len(lines) == 0 {
-		c.logf(stagePreConnect, 31, true, "不是 HTTP/1.1 消息")
+		logSniffFail(c, "非HTTP数据(空请求)", buf[:n])
 		return
 	}
 	// 解析请求行，获得路径
 	reqLine := strings.Fields(lines[0])
 	if len(reqLine) < 2 {
-		c.logf(stagePreConnect, 31, true, "解析 HTTP/1.1 请求异常")
+		logSniffFail(c, "HTTP请求行解析失败", buf[:n])
 		return
 	}
 	path := reqLine[1]
@@ -283,7 +331,7 @@ func handleHTTPRedirect(conn net.Conn, c *connCtx) {
 	}
 	// 如果没有 Host 或者 Host 为空，则不进行重定向，直接断开连接
 	if host == "" {
-		c.logf(stagePreConnect, 31, true, "未找到域名(HTTP), 忽略...")
+		logSniffFail(c, "HTTP请求中未找到Host域名", buf[:n])
 		return
 	}
 	c.setHost(host) // 域名已知，后续日志前缀带上域名
@@ -341,8 +389,14 @@ func serve(conn net.Conn, c *connCtx) {
 		}
 		fullHeader = append(fullHeader, buf[:n]...)
 
+		// 首字节快速嗅探：不符合 TLS 记录特征的流量（如 SSH-2.0- 的 SSH 协议、明文 HTTP）永远解析不出 SNI，
+		// 首次收到数据时立即输出一条嗅探失败日志便于辨认（仅判定一次；不改变原有等待/关闭行为，只补可观测性）
+		if attempts == 0 && len(fullHeader) >= 2 && !isTLSRecordHeader(fullHeader) {
+			c.logf(stageSniffFail, 31, false, "非TLS数据 首字节:%s (解析不出SNI, 继续等待)", safePreview(fullHeader, 64))
+		}
+
 		if len(fullHeader) < 5 { // 判断是不是 TLS 握手消息
-			c.logf(stagePreConnect, 31, true, "不是 TLS 握手消息")
+			logSniffFail(c, "非TLS数据(不足5字节)", fullHeader)
 			return
 		} else if IsCompleteHandshake(fullHeader) { // 检查是否已经接收到完整的 TLS 握手消息
 			break // 如果已经完整，那么退出循环
@@ -350,7 +404,7 @@ func serve(conn net.Conn, c *connCtx) {
 
 		attempts++
 		if attempts >= maxAttempts {
-			c.logf(stagePreConnect, 31, false, "接收握手消息超时...")
+			logSniffFail(c, "接收握手消息超时(始终未收到完整TLS握手)", fullHeader)
 			return // 如果超过最大等待次数，退出函数
 		}
 	}
@@ -361,7 +415,7 @@ func serve(conn net.Conn, c *connCtx) {
 	ServerName := getSNIServerName(fullHeader, c) // 获取 SNI 域名
 
 	if ServerName == "" {
-		c.logf(stagePreConnect, 31, true, "未找到 SNI 域名(HTTPS), 忽略...")
+		logSniffFail(c, "TLS握手中未找到SNI域名", fullHeader)
 		return
 	}
 	c.setHost(ServerName) // 域名已知，后续日志前缀带上域名
@@ -385,19 +439,19 @@ func IsCompleteHandshake(header []byte) bool {
 func getSNIServerName(buf []byte, c *connCtx) string {
 	n := len(buf)
 	if n < 5 {
-		c.logf(stagePreConnect, 31, true, "不是 TLS 握手消息")
+		logSniffFail(c, "非TLS数据(不足5字节)", buf)
 		return ""
 	}
 
 	// TLS 记录类型
 	if recordType(buf[0]) != recordTypeHandshake {
-		c.logf(stagePreConnect, 31, true, "不是 TLS")
+		logSniffFail(c, fmt.Sprintf("非TLS数据(记录类型: %d)", buf[0]), buf)
 		return ""
 	}
 
 	// TLS 主要版本
 	if buf[1] != 3 {
-		c.logf(stagePreConnect, 31, true, "不支持 TLS 版本 < 3")
+		logSniffFail(c, fmt.Sprintf("不支持TLS版本<3(主版本: %d)", buf[1]), buf)
 		return ""
 	}
 
@@ -407,7 +461,7 @@ func getSNIServerName(buf []byte, c *connCtx) string {
 
 	// 握手消息类型
 	if buf[5] != typeClientHello {
-		c.logf(stagePreConnect, 31, true, "不是 Client Hello 消息")
+		logSniffFail(c, fmt.Sprintf("不是ClientHello消息(握手类型: %d)", buf[5]), buf)
 		return ""
 	}
 
@@ -416,7 +470,7 @@ func getSNIServerName(buf []byte, c *connCtx) string {
 	// Client Hello 不包含 TLS 标头, 5 字节
 	ret := msg.unmarshal(buf[5:n])
 	if !ret {
-		c.logf(stagePreConnect, 31, true, "解析 Client Hello 消息失败")
+		logSniffFail(c, "解析ClientHello消息失败", buf)
 		return ""
 	}
 	return msg.serverName
