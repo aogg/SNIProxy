@@ -109,20 +109,89 @@ func TestMatchForwardRules(t *testing.T) {
 
 // ---------- backendResult.backendDesc（字节日志中的后端描述） ----------
 
-// backendDesc 格式："后端[ip:port 候选N/M]"，IPv6 地址需加方括号
+// backendDesc 格式："后端[ip:port 候选N/M](出口路径标签)"，IPv6 地址需加方括号；
+// 末尾标签由 pathTag 提供，零值 viaProxy=false 且 cfg.EnableSocks=false 时为 "(直连)"
 func TestBackendResult_BackendDesc(t *testing.T) {
+	saveCfg(t) // backendDesc 经 pathTag 读全局 cfg.EnableSocks，测试内固定为直连、测完恢复
+	cfg.EnableSocks = false
+
 	v4 := &backendResult{ip: net.ParseIP("1.2.3.4"), index: 2, total: 4}
-	if got, want := v4.backendDesc("443"), "后端[1.2.3.4:443 候选2/4]"; got != want {
+	if got, want := v4.backendDesc("443"), "后端[1.2.3.4:443 候选2/4](直连)"; got != want {
 		t.Fatalf("IPv4 描述 = %q, 期望 %q", got, want)
 	}
 
 	v6 := &backendResult{ip: net.ParseIP("2001:db8::1"), index: 1, total: 2}
-	if got, want := v6.backendDesc("443"), "后端[[2001:db8::1]:443 候选1/2]"; got != want {
+	if got, want := v6.backendDesc("443"), "后端[[2001:db8::1]:443 候选1/2](直连)"; got != want {
 		t.Fatalf("IPv6 描述(地址应加方括号) = %q, 期望 %q", got, want)
 	}
 
 	v4b := &backendResult{ip: net.ParseIP("1.2.3.4"), index: 1, total: 1}
-	if got, want := v4b.backendDesc("8443"), "后端[1.2.3.4:8443 候选1/1]"; got != want {
+	if got, want := v4b.backendDesc("8443"), "后端[1.2.3.4:8443 候选1/1](直连)"; got != want {
 		t.Fatalf("非默认端口描述 = %q, 期望 %q", got, want)
+	}
+}
+
+// ---------- 出口路径日志标签（round1Tag/pathTag/backendDesc 末尾标签） ----------
+
+// round1Tag 第 1 轮出口路径标签：cfg.EnableSocks=true → (socks5)，false → (直连)
+func TestRound1Tag(t *testing.T) {
+	saveCfg(t) // round1Tag 读全局 cfg.EnableSocks，测试内临时修改、测完恢复，避免影响其他用例
+
+	cfg.EnableSocks = false
+	if got, want := round1Tag(), pathTagDirect; got != want {
+		t.Fatalf("EnableSocks=false 时 round1Tag = %q, 期望 %q", got, want)
+	}
+
+	cfg.EnableSocks = true
+	if got, want := round1Tag(), pathTagSocks5; got != want {
+		t.Fatalf("EnableSocks=true 时 round1Tag = %q, 期望 %q", got, want)
+	}
+}
+
+// pathTag 出口路径标签单一来源：viaProxy=true → (AGAIN_PROXY)（与 cfg.EnableSocks 无关）；
+// viaProxy=false 时按 cfg.EnableSocks 区分 (直连)/(socks5)
+func TestBackendResult_PathTag(t *testing.T) {
+	saveCfg(t) // 非代理连接的 pathTag 读全局 cfg.EnableSocks，测试内临时修改、测完恢复，避免影响其他用例
+
+	proxy := &backendResult{viaProxy: true}
+	cfg.EnableSocks = false
+	if got, want := proxy.pathTag(), pathTagAgainProxy; got != want {
+		t.Fatalf("viaProxy=true 且 EnableSocks=false 时 pathTag = %q, 期望 %q", got, want)
+	}
+	cfg.EnableSocks = true
+	if got, want := proxy.pathTag(), pathTagAgainProxy; got != want {
+		t.Fatalf("viaProxy=true 且 EnableSocks=true 时 pathTag = %q, 期望 %q", got, want)
+	}
+
+	direct := &backendResult{viaProxy: false}
+	cfg.EnableSocks = false
+	if got, want := direct.pathTag(), pathTagDirect; got != want {
+		t.Fatalf("viaProxy=false 且 EnableSocks=false 时 pathTag = %q, 期望 %q", got, want)
+	}
+	cfg.EnableSocks = true
+	if got, want := direct.pathTag(), pathTagSocks5; got != want {
+		t.Fatalf("viaProxy=false 且 EnableSocks=true 时 pathTag = %q, 期望 %q", got, want)
+	}
+}
+
+// backendDesc 末尾追加的出口路径标签与 pathTag 同源：(直连)/(socks5)/(AGAIN_PROXY) 三种输出
+func TestBackendResult_BackendDescPathTag(t *testing.T) {
+	saveCfg(t) // backendDesc 经 pathTag 读全局 cfg.EnableSocks，测试内临时修改、测完恢复，避免影响其他用例
+
+	cfg.EnableSocks = false
+	direct := &backendResult{ip: net.ParseIP("1.2.3.4"), index: 1, total: 1, viaProxy: false}
+	if got, want := direct.backendDesc("443"), "后端[1.2.3.4:443 候选1/1](直连)"; got != want {
+		t.Fatalf("直连描述 = %q, 期望 %q", got, want)
+	}
+
+	cfg.EnableSocks = true
+	socks := &backendResult{ip: net.ParseIP("1.2.3.4"), index: 1, total: 1, viaProxy: false}
+	if got, want := socks.backendDesc("443"), "后端[1.2.3.4:443 候选1/1](socks5)"; got != want {
+		t.Fatalf("Socks5 前置描述 = %q, 期望 %q", got, want)
+	}
+
+	proxy := &backendResult{ip: net.ParseIP("1.2.3.4"), index: 1, total: 1, viaProxy: true}
+	if got, want := proxy.backendDesc("443"), "后端[1.2.3.4:443 候选1/1](AGAIN_PROXY)"; got != want {
+		t.Fatalf("AGAIN_PROXY 描述 = %q, 期望 %q", got, want)
 	}
 }
