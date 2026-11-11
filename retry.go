@@ -477,8 +477,8 @@ func dialBackendRound(c *connCtx, host, port string, ordered []net.IP, data []by
 					dnsRetryCacheInstance.setVerifyResult(host, ip.String(), true, "")
 					c.logf(stagePreConnect, 32, false, "后端验证通过%s%s: [%s]", roundTag, attempt, addr)
 				} else if !r.ok {
-					// 60 秒内验证失败过的 IP 直接跳过，不再探测
-					c.logf(stagePreConnect, 31, true, "后端验证失败(缓存)%s%s: [%s], %s, 跳过", roundTag, attempt, addr, r.reason)
+					// 60 秒内验证失败过的 IP 直接跳过，不再探测（生产可见，便于排查“部分候选被缓存跳过”的连前耗时）
+					c.logf(stagePreConnect, 31, false, "后端验证失败(缓存)%s%s: [%s], %s, 跳过", roundTag, attempt, addr, r.reason)
 					continue
 				}
 				// 验证通过（含 10 分钟内缓存命中），继续走下面的正常连接流程

@@ -141,6 +141,7 @@ type configModel struct {
 	AgainProxy       string   `yaml:"again_proxy,omitempty"`        // AGAIN_PROXY HTTP 回退代理（环境变量 AGAIN_PROXY 未设置或值非法时使用，值格式同环境变量）
 	ProgressInterval *int     `yaml:"progress_interval,omitempty"`  // 传输进度日志间隔秒（指针是为了区分“未配置”，未配置时默认 10；显式 0=关闭进度日志）
 	StallTimeout     *int     `yaml:"stall_timeout,omitempty"`      // 停滞判定秒（指针是为了区分“未配置”，未配置时默认 30；显式 0=关闭停滞检测）
+	StuckTimeout     *int     `yaml:"stuck_timeout,omitempty"`      // 卡顿判定秒（指针是为了区分“未配置”，未配置时默认 3；显式 0=关闭卡顿检测；单请求整体无数据超过该秒数输出卡顿日志（红色，疑似下载改黄色提示））
 }
 
 func init() {
@@ -216,10 +217,18 @@ func main() {
 	// 传输进度/停滞检测：未配置时填充默认值（显式 0=关闭，负数与 0 同义按关闭处理）
 	cfg.ProgressInterval = normalizeTransferInterval(cfg.ProgressInterval, defaultProgressInterval)
 	cfg.StallTimeout = normalizeTransferInterval(cfg.StallTimeout, defaultStallTimeout)
+	cfg.StuckTimeout = normalizeTransferInterval(cfg.StuckTimeout, defaultStuckTimeout)
 	if *cfg.ProgressInterval <= 0 && *cfg.StallTimeout <= 0 {
 		serviceLogger("传输日志: 已关闭 (↑=客户端→后端, ↓=后端→客户端)", 32, false)
 	} else {
 		serviceLogger(fmt.Sprintf("传输日志: 进度间隔 %ds, 停滞判定 %ds (↑=客户端→后端, ↓=后端→客户端)", *cfg.ProgressInterval, *cfg.StallTimeout), 32, false)
+	}
+
+	// 卡顿检测（tier1，红色卡顿日志）：未配置时填充默认值（显式 0=关闭）
+	if *cfg.StuckTimeout <= 0 {
+		serviceLogger("卡顿检测: 已关闭", 32, false)
+	} else {
+		serviceLogger(fmt.Sprintf("卡顿检测: %ds (0=关闭)", *cfg.StuckTimeout), 32, false)
 	}
 
 	// AGAIN_PROXY HTTP 代理：启动时解析一次（环境变量 AGAIN_PROXY/again_proxy 优先，未设置或值非法时再用 config.yaml 的 again_proxy），
@@ -492,6 +501,7 @@ func forward(conn net.Conn, c *connCtx, data []byte, dst string) {
 	}
 
 	// 解析目标 host，拿到所有候选 IP（支持直接 IP 或域名）
+	stuckTimeout := time.Duration(*cfg.StuckTimeout) * time.Second // 卡顿判定时长（连前缓慢告警与结束原因改写共用；main 已填充默认值，0=关闭）
 	dnsStart := time.Now()
 	ips, err := resolveHostIPs(host)
 	if err != nil {
@@ -499,6 +509,9 @@ func forward(conn net.Conn, c *connCtx, data []byte, dst string) {
 		return
 	}
 	c.logf(stagePreConnect, 32, false, "DNS解析完成: %d 个IP, 耗时 %v", len(ips), time.Since(dnsStart))
+	if stuckTimeout > 0 && time.Since(dnsStart) > stuckTimeout { // DNS 解析缓慢告警（非 debug 必出，疑似 DNS 服务异常/网络不畅）
+		c.logf(stagePreConnect, 31, false, "DNS解析缓慢: 耗时 %v", time.Since(dnsStart))
+	}
 
 	// 建立后端连接前先做安全检查，避免把流量再次传回本机导致死循环
 	if blocked, reason := shouldBlockForwardIPs(ips, c.srcAddr); blocked {
@@ -509,8 +522,11 @@ func forward(conn net.Conn, c *connCtx, data []byte, dst string) {
 	// 按历史结果排序后依次尝试连接所有候选 IP（内部自动重试）
 	res := dialBackendRetry(c, host, port, ips, data)
 	if res == nil {
-		c.logf(stagePreConnect, 31, false, "所有后端 IP 连接失败(HTTPS): [%s], 共尝试 %d 个", dst, len(ips))
+		c.logf(stagePreConnect, 31, false, "所有后端 IP 连接失败(HTTPS): [%s], 共尝试 %d 个, 总耗时 %v", dst, len(ips), time.Since(c.start).Truncate(time.Second))
 		return
+	}
+	if stuckTimeout > 0 && time.Since(c.start) > stuckTimeout { // 连接成功但距连接开始超过卡顿判定时长（多 IP 重试耗时的可观测性，非 debug 必出）
+		c.logf(stagePreConnect, 31, false, "后端连接缓慢: 距连接开始 %v, 实际使用 %s", time.Since(c.start), res.backendDesc(port))
 	}
 	backend := res.conn
 	defer backend.Close()
@@ -535,13 +551,16 @@ func forward(conn net.Conn, c *connCtx, data []byte, dst string) {
 	conChk := make(chan struct{})
 	go ioReflector(ctx, backend, conn, false, conChk, c, backendDesc, ts, closeInfo)
 	go ioReflector(ctx, conn, backend, true, conChk, c, backendDesc, ts, closeInfo)
-	startTransferWatcher(ctx, c, backendDesc, ts, c.start) // 传输监视：进度/停滞日志，随 ctx 退出
+	startTransferWatcher(ctx, c, backendDesc, ts, c.start) // 传输监视：进度/停滞/卡顿日志，随 ctx 退出
 	<-conChk
 	// 取消上下文，通知另一个 ioReflector 退出
 	cancel()
 
 	// 连接结束总结（非 debug 必出）：先结束方向的原因 + 总时长 + 双向累计字节（正常断开绿色 32，带 error 红色 31）
 	reason := closeInfo.get()
+	if rewritten, ok := stuckClientAbandonCloseReason(reason, ts, stuckTimeout, time.Now()); ok {
+		reason = rewritten // 客户端在停滞期间放弃等待：改写结束原因并把结束总结标红
+	}
 	color := 32 // 正常断开：绿色
 	if reason.isError {
 		color = 31 // 异常结束（带 error）：红色

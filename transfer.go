@@ -13,7 +13,12 @@ import (
 const (
 	defaultProgressInterval = 10 // 进度日志默认间隔（秒）
 	defaultStallTimeout     = 30 // 停滞检测默认时长（秒）
+	defaultStuckTimeout     = 3  // 卡顿检测默认时长（秒）
 )
+
+// downloadBytesThreshold 疑似下载的 ↓ 累计字节阈值（1MB）：
+// ↓ 后端→客户端 累计达到该值视为客户端可能在下载大文件，卡顿日志降级为黄色提示（而非红色告警）
+const downloadBytesThreshold int64 = 1 << 20
 
 // transferStats 连接双向字节计数
 // （int64 + sync/atomic 包函数实现并发安全，兼容 go1.18，不使用 go1.19+ 才有的 atomic 类型）
@@ -137,20 +142,58 @@ func humanBytes(n int64) string {
 	return fmt.Sprintf("%.1fTB", value/unit) // 超过 GB 继续按 TB 展示
 }
 
-// startTransferWatcher 启动传输监视 goroutine（进度/停滞日志），两项检测都关闭时不启动
+// isLikeDownload 判断该连接是否疑似下载：↓ 后端→客户端 累计字节达到 downloadBytesThreshold(1MB) 即视为疑似下载
+func isLikeDownload(down int64) bool {
+	return down >= downloadBytesThreshold
+}
+
+// stuckClientAbandonCloseReason 判断连接结束是否属于“客户端在停滞期间放弃等待”：
+// 改写条件（全部满足才改写）：卡顿检测开启(stuckTimeout>0)、结束原因是不带 error 的“客户端断开”（精确匹配）、
+// 结束时距最后数据（lastActive）已停滞 ≥ stuck_timeout、且 ↓ 累计未达疑似下载阈值（下载中的客户端断开是正常行为）。
+// 命中时把结束原因改写为带实际停滞时长与 ↓ 累计量的异常文案（isError=true，结束总结随之变红），
+// 便于在生产日志里区分“客户端正常用完断开”与“连接卡死后客户端放弃”。
+// 纯函数（不含 IO），返回改写后的原因与是否改写（未命中时原样返回），方便单元测试
+func stuckClientAbandonCloseReason(reason transferCloseReason, ts *transferStats, stuckTimeout time.Duration, now time.Time) (transferCloseReason, bool) {
+	// ////////////////  校验参数  start  ////////////////////////////////////////////////
+	if stuckTimeout <= 0 || reason.isError || reason.text != "客户端断开" {
+		return reason, false // 检测关闭 / 异常结束（读写出错等）/ 非客户端断开（如 后端断开），保持原样
+	}
+	// ////////////////  校验参数  end ////////////////////////////////////////////////
+	// ////////////////  核心逻辑  start  ////////////////////////////////////////////////
+	stallFor := now.Sub(ts.lastActive()) // 结束时的实际停滞时长（距最后任一方向活动）
+	if stallFor < stuckTimeout {
+		return reason, false // 停滞不足卡顿判定时长，视为客户端正常断开
+	}
+	down := ts.down()
+	if down >= downloadBytesThreshold {
+		return reason, false // 疑似下载中的客户端断开（下载完成/用户取消）不改写
+	}
+	// ////////////////  核心逻辑  end ////////////////////////////////////////////////
+	// ////////////////  返回  start  ////////////////////////////////////////////////
+	return transferCloseReason{
+		text:    fmt.Sprintf("客户端断开(停滞 %v 期间客户端放弃, ↓%s)", stallFor.Truncate(time.Second), humanBytes(down)),
+		isError: true, // 结束总结随之变红
+	}, true
+	// ////////////////  返回  end ////////////////////////////////////////////////
+}
+
+// startTransferWatcher 启动传输监视 goroutine（进度/停滞/卡顿日志），三项检测都关闭时不启动
 func startTransferWatcher(ctx context.Context, c *connCtx, backendDesc string, ts *transferStats, start time.Time) {
 	// ////////////////  校验参数  start  ////////////////////////////////////////////////
 	progressInterval := time.Duration(*cfg.ProgressInterval) * time.Second // 进度日志间隔（main 已填充默认值，0=关闭）
-	stallTimeout := time.Duration(*cfg.StallTimeout) * time.Second         // 停滞判定时长（main 已填充默认值，0=关闭）
-	if progressInterval <= 0 && stallTimeout <= 0 {
-		return // 进度与停滞检测均已关闭，不启动监视
+	stallTimeout := time.Duration(*cfg.StallTimeout) * time.Second         // 停滞判定时长（tier2，main 已填充默认值，0=关闭）
+	stuckTimeout := time.Duration(*cfg.StuckTimeout) * time.Second         // 卡顿判定时长（tier1，main 已填充默认值，0=关闭）
+	if progressInterval <= 0 && stallTimeout <= 0 && stuckTimeout <= 0 {
+		return // 进度、停滞与卡顿检测均已关闭，不启动监视
 	}
 	// ////////////////  校验参数  end ////////////////////////////////////////////////
-	go transferWatcher(ctx, c, backendDesc, ts, start, progressInterval, stallTimeout)
+	go transferWatcher(ctx, c, backendDesc, ts, start, progressInterval, stallTimeout, stuckTimeout)
 }
 
-// transferWatcher 传输监视循环：每秒 tick 一次，按配置输出进度日志（青色 36）与停滞日志（黄色 33），随 ctx.Done 退出
-func transferWatcher(ctx context.Context, c *connCtx, backendDesc string, ts *transferStats, start time.Time, progressInterval, stallTimeout time.Duration) {
+// transferWatcher 传输监视循环：每秒 tick 一次，按配置输出进度日志（青色 36）、
+// 卡顿日志（tier1：红色 31，疑似下载改黄色 33，stuck_timeout=0 时本层整体关闭）与停滞日志（tier2：黄色 33），
+// 卡顿/停滞恢复时输出对应的解除日志，随 ctx.Done 退出
+func transferWatcher(ctx context.Context, c *connCtx, backendDesc string, ts *transferStats, start time.Time, progressInterval, stallTimeout, stuckTimeout time.Duration) {
 	// ////////////////  准备数据  start  ////////////////////////////////////////////////
 	ticker := time.NewTicker(time.Second)
 	defer ticker.Stop()
@@ -158,8 +201,11 @@ func transferWatcher(ctx context.Context, c *connCtx, backendDesc string, ts *tr
 	var (
 		lastUp, lastDown int64     // 上次进度日志时的双向累计字节（用于计算窗口速率与新增字节判定）
 		lastProgress     time.Time // 上次进度日志时间（零值时以连接开始时间为基准）
-		stalling         bool      // 是否处于停滞状态（停滞期间不再输出进度日志）
+		stalling         bool      // 是否处于停滞状态（tier2，停滞期间不再输出进度日志）
 		lastStallLog     time.Time // 上次停滞日志时间（用于每隔 stall_timeout 重复输出一次）
+		stucking         bool      // 是否处于卡顿状态（tier1，独立于停滞 tier2 的状态机）
+		lastStuckLog     time.Time // 上次卡顿日志时间（用于每隔 stuck_timeout 重复输出一次）
+		stuckStart       time.Time // 本次卡顿的数据停止时刻（首次触发时记录，卡顿解除时用于计算实际停滞时长）
 	)
 
 	// logProgress 输出一条进度日志并推进进度窗口基准（累计量、相对上次进度日志的窗口速率、距连接开始时长）
@@ -173,6 +219,20 @@ func transferWatcher(ctx context.Context, c *connCtx, backendDesc string, ts *tr
 			humanBytes(int64(float64(up-lastUp)/window)), humanBytes(int64(float64(down-lastDown)/window)),
 			time.Since(start).Truncate(time.Second), backendDesc)
 		lastUp, lastDown, lastProgress = up, down, now
+	}
+
+	// logStuck 输出一条卡顿日志（tier1，非 debug 必出）：非疑似下载红色 31 告警、疑似下载黄色 33 提示，
+	// noData 为日志展示的“无数据时长”（首次触发传配置的 stuck_timeout，重复时传实际 stallFor，对齐停滞日志重复模式）
+	logStuck := func(noData time.Duration, up, down int64) {
+		if isLikeDownload(down) {
+			c.logf(stageTransfer, 33, false, "卡顿 %v 无数据: ↑%s ↓%s, 最后数据 %s, 疑似下载:是(↓%s), 已运行 %v, %s",
+				noData, humanBytes(up), humanBytes(down), ts.lastActive().Format("15:04:05"), humanBytes(ts.down()),
+				time.Since(start).Truncate(time.Second), backendDesc)
+			return
+		}
+		c.logf(stageTransfer, 31, false, "卡顿 %v 无数据: ↑%s ↓%s, 最后数据 %s, 疑似下载:否, 已运行 %v, %s",
+			noData, humanBytes(up), humanBytes(down), ts.lastActive().Format("15:04:05"),
+			time.Since(start).Truncate(time.Second), backendDesc)
 	}
 	// ////////////////  准备数据  end ////////////////////////////////////////////////
 
@@ -206,6 +266,28 @@ func transferWatcher(ctx context.Context, c *connCtx, backendDesc string, ts *tr
 					stallFor.Truncate(time.Second), humanBytes(up), humanBytes(down), ts.lastActive().Format("15:04:05"), backendDesc)
 			}
 			continue // 停滞期间不再输出进度日志
+		}
+
+		// 卡顿检测（tier1）：两个方向连续无数据达到 stuck_timeout（先判停滞 tier2，tier2 未命中才轮到本层；
+		// stuck_timeout=0 时本层整体关闭，行为与无卡顿检测时完全一致）
+		if stuckTimeout > 0 && stallFor >= stuckTimeout {
+			if !stucking { // 首次卡顿：输出一条（展示配置的判定时长），之后每隔 stuck_timeout 重复一次
+				stucking = true
+				lastStuckLog = now
+				stuckStart = ts.lastActive() // 记录数据停止时刻，卡顿解除时据此计算实际停滞时长
+				logStuck(stuckTimeout, up, down)
+			} else if now.Sub(lastStuckLog) >= stuckTimeout { // 重复卡顿日志：把判定时长换成实际持续时长
+				lastStuckLog = now
+				logStuck(stallFor.Truncate(time.Second), up, down)
+			}
+			continue // 卡顿期间不再输出进度日志
+		}
+
+		// 卡顿恢复：卡顿日志输出过、之后有新数据到达（stallFor < stuck_timeout），
+		// 输出一条解除日志（带实际停滞时长）后不 continue，正常走进度日志逻辑（与停滞恢复衔接）
+		if stucking {
+			stucking = false
+			c.logf(stageTransfer, 32, false, "卡顿解除: 停滞 %v 后恢复数据流", now.Sub(stuckStart).Truncate(time.Second))
 		}
 
 		// 停滞恢复：停滞中有新数据到达，停滞状态解除，可再输出一条进度日志表示恢复
