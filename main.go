@@ -127,21 +127,23 @@ func isTLSRecordHeader(data []byte) bool {
 
 // 配置文件结构
 type configModel struct {
-	ForwardRules     []string `yaml:"rules,omitempty"`
-	ListenAddr       string   `yaml:"listen_addr,omitempty"`
-	ListenAddrHTTP   string   `yaml:"listen_addr_http,omitempty"`
-	EnableSocks      bool     `yaml:"enable_socks5,omitempty"`
-	SocksAddr        string   `yaml:"socks_addr,omitempty"`
-	SocksUsername    string   `yaml:"socks_username,omitempty"`
-	SocksPassword    string   `yaml:"socks_password,omitempty"`
-	AllowAllHosts    bool     `yaml:"allow_all_hosts,omitempty"`
-	DialTimeout      int      `yaml:"dial_timeout,omitempty"`       // 连接单个后端 IP 的超时时间（秒）
-	FirstByteTimeout int      `yaml:"first_byte_timeout,omitempty"` // 等待后端响应第一个字节的超时时间（秒）
-	VerifyTLS        *bool    `yaml:"verify_tls,omitempty"`         // 连接前是否用真实 TLS 握手验证候选 IP（指针是为了区分“未配置”，未配置时默认开启）
-	AgainProxy       string   `yaml:"again_proxy,omitempty"`        // AGAIN_PROXY HTTP 回退代理（环境变量 AGAIN_PROXY 未设置或值非法时使用，值格式同环境变量）
-	ProgressInterval *int     `yaml:"progress_interval,omitempty"`  // 传输进度日志间隔秒（指针是为了区分“未配置”，未配置时默认 10；显式 0=关闭进度日志）
-	StallTimeout     *int     `yaml:"stall_timeout,omitempty"`      // 停滞判定秒（指针是为了区分“未配置”，未配置时默认 30；显式 0=关闭停滞检测）
-	StuckTimeout     *int     `yaml:"stuck_timeout,omitempty"`      // 卡顿判定秒（指针是为了区分“未配置”，未配置时默认 3；显式 0=关闭卡顿检测；单请求整体无数据超过该秒数输出卡顿日志（红色，疑似下载改黄色提示））
+	ForwardRules      []string `yaml:"rules,omitempty"`
+	ListenAddr        string   `yaml:"listen_addr,omitempty"`
+	ListenAddrHTTP    string   `yaml:"listen_addr_http,omitempty"`
+	EnableSocks       bool     `yaml:"enable_socks5,omitempty"`
+	SocksAddr         string   `yaml:"socks_addr,omitempty"`
+	SocksUsername     string   `yaml:"socks_username,omitempty"`
+	SocksPassword     string   `yaml:"socks_password,omitempty"`
+	AllowAllHosts     bool     `yaml:"allow_all_hosts,omitempty"`
+	DialTimeout       int      `yaml:"dial_timeout,omitempty"`        // 连接单个后端 IP 的超时时间（秒）
+	FirstByteTimeout  int      `yaml:"first_byte_timeout,omitempty"`  // 等待后端响应第一个字节的超时时间（秒）
+	VerifyTLS         *bool    `yaml:"verify_tls,omitempty"`          // 连接前是否用真实 TLS 握手验证候选 IP（指针是为了区分“未配置”，未配置时默认开启）
+	AgainProxy        string   `yaml:"again_proxy,omitempty"`         // AGAIN_PROXY HTTP 回退代理（环境变量 AGAIN_PROXY 未设置或值非法时使用，值格式同环境变量）
+	AgainProxyTimeout *int     `yaml:"again_proxy_timeout,omitempty"` // 第 2 轮 AGAIN_PROXY 代理轮询的单候选各阶段超时秒（指针是为了区分“未配置”，未配置时默认 10；显式 <=0 = 沿用第 1 轮同款超时）
+	AgainProxyBudget  *int     `yaml:"again_proxy_budget,omitempty"`  // 第 2 轮 AGAIN_PROXY 代理轮询的整轮总预算秒（指针是为了区分“未配置”，未配置时默认 60；显式 <=0 = 不设轮预算）
+	ProgressInterval  *int     `yaml:"progress_interval,omitempty"`   // 传输进度日志间隔秒（指针是为了区分“未配置”，未配置时默认 10；显式 0=关闭进度日志）
+	StallTimeout      *int     `yaml:"stall_timeout,omitempty"`       // 停滞判定秒（指针是为了区分“未配置”，未配置时默认 30；显式 0=关闭停滞检测）
+	StuckTimeout      *int     `yaml:"stuck_timeout,omitempty"`       // 卡顿判定秒（指针是为了区分“未配置”，未配置时默认 3；显式 0=关闭卡顿检测；单请求整体无数据超过该秒数输出卡顿日志（红色，疑似下载改黄色提示））
 }
 
 func init() {
@@ -241,6 +243,19 @@ func main() {
 	} else {
 		serviceLogger(fmt.Sprintf("AGAIN_PROXY: 开启 (来源: 环境变量 %s, %s)", envHTTPProxy.Name, envHTTPProxy.maskedURL()), 32, false)
 	}
+
+	// AGAIN_PROXY 第 2 轮独立超时/轮预算：环境变量（AGAIN_PROXY_TIMEOUT/AGAIN_PROXY_BUDGET，先大写后小写）优先，
+	// 未设置或值非法被忽略时再用 config.yaml 的 again_proxy_timeout/again_proxy_budget（未配置填默认值 10/60；
+	// 显式 <=0 的语义：单候选超时 = 沿用第 1 轮同款超时（旧行为），轮预算 = 不设轮预算），仅第 2 轮生效，不影响第 1 轮
+	if v, ok := parseEnvAgainProxyInt(envAgainTimeoutNames); ok {
+		cfg.AgainProxyTimeout = &v
+	}
+	if v, ok := parseEnvAgainProxyInt(envAgainBudgetNames); ok {
+		cfg.AgainProxyBudget = &v
+	}
+	// 复用 normalizeTransferInterval 的规范化语义：nil 填默认值，负数归为 0（沿用第 1 轮超时 / 不设轮预算）
+	cfg.AgainProxyTimeout = normalizeTransferInterval(cfg.AgainProxyTimeout, defaultAgainProxyTimeout)
+	cfg.AgainProxyBudget = normalizeTransferInterval(cfg.AgainProxyBudget, defaultAgainProxyBudget)
 
 	startSniProxy() // 启动 SNI Proxy
 }

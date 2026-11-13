@@ -7,6 +7,7 @@ import (
 	"net"
 	"net/url"
 	"os"
+	"strconv"
 	"strings"
 	"time"
 
@@ -29,6 +30,13 @@ const configAgainProxyName = "config again_proxy"
 var envProxyNames = []string{
 	"AGAIN_PROXY", "again_proxy",
 }
+
+// envAgainTimeoutNames/envAgainBudgetNames 依次探测的第 2 轮独立超时/轮预算环境变量
+// （沿用 AGAIN_PROXY 代理地址的同款优先级：先大写后小写，取第一个非空值）
+var (
+	envAgainTimeoutNames = []string{"AGAIN_PROXY_TIMEOUT", "again_proxy_timeout"}
+	envAgainBudgetNames  = []string{"AGAIN_PROXY_BUDGET", "again_proxy_budget"}
+)
 
 // envProxyLookup 可注入的环境变量查询函数（默认 os.LookupEnv，便于将来单元测试）
 var envProxyLookup = os.LookupEnv
@@ -78,6 +86,25 @@ func parseEnvHTTPProxy() *httpProxyAddr {
 		return p
 	}
 	return nil
+}
+
+// parseEnvAgainProxyInt 按优先级取第一个非空的整型环境变量值（names 先大写后小写），
+// 用于 AGAIN_PROXY_TIMEOUT/AGAIN_PROXY_BUDGET：取值为首个非空的变量（不再继续尝试低优先级变量），
+// 值非法时 warn 一条后按“未设置”处理（返回 ok=false，回退用 config.yaml 配置）——与代理地址的 env 解析行为一致
+func parseEnvAgainProxyInt(names []string) (int, bool) {
+	for _, name := range names {
+		val, ok := envProxyLookup(name)
+		if !ok || strings.TrimSpace(val) == "" {
+			continue
+		}
+		v, err := strconv.Atoi(strings.TrimSpace(val))
+		if err != nil {
+			serviceLogger(fmt.Sprintf("AGAIN_PROXY: %s=%s 的值无法使用(%v), 已忽略, 等同未设置", name, strings.TrimSpace(val), err), 33, false)
+			return 0, false
+		}
+		return v, true
+	}
+	return 0, false
 }
 
 // resolveAgainProxy 解析 AGAIN_PROXY 代理的最终来源（启动时调用一次）：

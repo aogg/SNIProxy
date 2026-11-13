@@ -401,6 +401,81 @@ func (r *backendResult) backendDesc(port string) string {
 	return fmt.Sprintf("后端[%s 候选%d/%d]%s", net.JoinHostPort(r.ip.String(), port), r.index, r.total, r.pathTag())
 }
 
+// ---------- 第 2 轮（AGAIN_PROXY 代理轮询）独立超时规划 ----------
+// 背景：跨大陆代理链路实测 TLS 握手成功样本要 6.2~6.5s，第 1 轮的 5s 预算必挂，
+// 因此第 2 轮的超时必须可独立配置，并支持整轮预算兜底（避免大量候选把连前耗时拖到分钟级）。
+
+// 第 2 轮独立超时的默认值（秒）；显式 <=0 的语义见 againProxyStageTimeout/againProxyBudgetSeconds
+const (
+	defaultAgainProxyTimeout = 10 // again_proxy_timeout 未配置时的默认值：单候选各阶段统一超时
+	defaultAgainProxyBudget  = 60 // again_proxy_budget 未配置时的默认值：第 2 轮整轮总预算
+)
+
+// againProxyStageTimeout 返回第 2 轮各阶段统一超时秒（未配置时已在启动阶段填默认值 10）：
+// 0 = again_proxy_timeout<=0 的显式旧行为：沿用第 1 轮同款超时（探测=first_byte_timeout、拨号=dial_timeout）
+func againProxyStageTimeout() int {
+	if cfg.AgainProxyTimeout == nil || *cfg.AgainProxyTimeout <= 0 {
+		return 0
+	}
+	return *cfg.AgainProxyTimeout
+}
+
+// againProxyBudgetSeconds 返回第 2 轮整轮预算秒（未配置时已在启动阶段填默认值 60）：0 = 不设轮预算
+func againProxyBudgetSeconds() int {
+	if cfg.AgainProxyBudget == nil || *cfg.AgainProxyBudget <= 0 {
+		return 0
+	}
+	return *cfg.AgainProxyBudget
+}
+
+// againProxyPlan 第 2 轮（AGAIN_PROXY 代理轮询）的独立超时规划：
+// 仅作用于该轮的三个阶段超时（TLS 验证探测/真实拨号/等首字节），并可选设置整轮总预算；
+// 第 1 轮（直连/Socks5）不使用本规划（dialBackendRound 的 plan 传 nil），行为保持逐字节不变
+type againProxyPlan struct {
+	stageTimeout int       // 单候选各阶段统一超时秒（0 = 沿用第 1 轮同款超时）
+	deadline     time.Time // 整轮预算截止时刻（零值 = 不设轮预算）
+	startedAt    time.Time // 进入第 2 轮的时刻（预算耗尽日志展示本轮已耗时）
+}
+
+// newAgainProxyPlan 创建第 2 轮超时规划，并紧挨着“开始 AGAIN_PROXY 代理轮询”输出一条独立的规划日志：
+// “AGAIN_PROXY 超时规划: 单候选 %ds, 轮预算 %ds”（again_proxy_timeout<=0 时单候选显示“沿用第1轮超时”）
+func newAgainProxyPlan(c *connCtx) *againProxyPlan {
+	stageTimeout := againProxyStageTimeout()
+	budget := againProxyBudgetSeconds()
+	timeoutPart := "单候选 沿用第1轮超时"
+	if stageTimeout > 0 {
+		timeoutPart = fmt.Sprintf("单候选 %ds", stageTimeout)
+	}
+	budgetPart := "轮预算 不设"
+	if budget > 0 {
+		budgetPart = fmt.Sprintf("轮预算 %ds", budget)
+	}
+	c.logf(stagePreConnect, 33, false, "AGAIN_PROXY 超时规划: %s, %s", timeoutPart, budgetPart)
+
+	p := &againProxyPlan{stageTimeout: stageTimeout, startedAt: time.Now()}
+	if budget > 0 {
+		p.deadline = p.startedAt.Add(time.Duration(budget) * time.Second) // 预算从进入第 2 轮起计时
+	}
+	return p
+}
+
+// clampTimeoutSec 把单个阶段超时秒收窄到不超过轮预算剩余时间 remaining，即 min(阶段超时, 剩余预算)：
+// 剩余时间向上取整为整秒（剩余 0.2s 也按 1s 算，避免收窄成 0 被误读成“该阶段不限制/不探测”导致拨号无限等待）；
+// t<=0（该阶段本来就不限制/不探测）语义保持不变
+func clampTimeoutSec(t int, remaining time.Duration) int {
+	if t <= 0 {
+		return t
+	}
+	maxSec := int((remaining + time.Second - 1) / time.Second)
+	if maxSec < 1 {
+		maxSec = 1
+	}
+	if t > maxSec {
+		return maxSec
+	}
+	return t
+}
+
 // dialBackendRetry 按“上次连接结果”排序后依次尝试连接 host 的所有候选 IP：
 //
 //	1.（TLS 验证开启时）先用真实 TLS 握手验证该 IP（结果缓存：成功 10 分钟、失败 60 秒）
@@ -427,7 +502,7 @@ func dialBackendRetry(c *connCtx, host, port string, ips []net.IP, data []byte) 
 	probeTimeout := verifyProbeTimeout() // 为 0 时表示不探测（verify_tls=false 等），完全保持旧行为
 
 	// 第 1 轮：直连或 Socks5 前置（GetDialer(cfg.EnableSocks)），结果写入 dnsRetryCache（出口路径标签按 cfg.EnableSocks 取 直连/socks5）
-	if res := dialBackendRound(c, host, port, ordered, data, GetDialer(cfg.EnableSocks), probeTimeout, round1Tag(), true); res != nil {
+	if res := dialBackendRound(c, host, port, ordered, data, GetDialer(cfg.EnableSocks), probeTimeout, round1Tag(), true, nil); res != nil {
 		return res
 	}
 
@@ -440,7 +515,9 @@ func dialBackendRetry(c *connCtx, host, port string, ips []net.IP, data []byte) 
 	// 必须复用第 1 轮最终的 ordered 列表的同一顺序（不得重新排序、去重或打乱），候选序号 (i/N) 按同一列表
 	c.logf(stagePreConnect, 33, false, "直连轮询全部失败(共%d个), 开始 AGAIN_PROXY 代理轮询", len(ordered))
 	proxyDialer := newHTTPProxyDialer(envHTTPProxy) // 连代理本身是直连 TCP（cfg.EnableSocks 只影响第 1 轮）
-	return dialBackendRound(c, host, port, ordered, data, proxyDialer, probeTimeout, pathTagAgainProxy, false)
+	// 第 2 轮独立超时规划：单候选各阶段超时可用 again_proxy_timeout 独立配置（跨大陆代理链路 5s 预算不够用），
+	// 整轮总预算用 again_proxy_budget 兜底；仅本轮生效，第 1 轮的超时/日志/缓存行为不受影响
+	return dialBackendRound(c, host, port, ordered, data, proxyDialer, probeTimeout, pathTagAgainProxy, false, newAgainProxyPlan(c))
 }
 
 // dialBackendRound dialBackendRetry 的单轮实现：按给定顺序对候选列表完整轮询一轮，
@@ -450,7 +527,8 @@ func dialBackendRetry(c *connCtx, host, port string, ips []net.IP, data []byte) 
 //	d          本轮使用的拨号器（第 1 轮为 GetDialer(cfg.EnableSocks)，代理轮询为 httpProxyDialer）
 //	roundTag   出口路径日志标签（第 1 轮为 "(直连)"/"(socks5)"，第 2 轮为 "(AGAIN_PROXY)"，插入在日志内容与候选序号之间以区分出口路径）
 //	report     是否把每个 IP 的结果写入 dnsRetryCache（代理轮询必须传 false，避免污染直连排序语义）
-func dialBackendRound(c *connCtx, host, port string, ordered []net.IP, data []byte, d proxy.Dialer, probeTimeout int, roundTag string, report bool) *backendResult {
+//	plan       第 2 轮独立超时规划（单候选阶段超时替换 + 整轮预算检查/收窄/耗尽中止）；第 1 轮必须传 nil（行为与旧版完全一致）
+func dialBackendRound(c *connCtx, host, port string, ordered []net.IP, data []byte, d proxy.Dialer, probeTimeout int, roundTag string, report bool, plan *againProxyPlan) *backendResult {
 	// 结果记录统一入口：代理轮询（report=false）不写缓存，stats 与 verify 缓存都不受影响
 	record := func(ip net.IP, success bool) {
 		if report {
@@ -462,12 +540,35 @@ func dialBackendRound(c *connCtx, host, port string, ordered []net.IP, data []by
 		addr := net.JoinHostPort(ip.String(), port)
 		attempt := fmt.Sprintf("(%d/%d)", i+1, len(ordered))
 
+		// 本次候选实际生效的各阶段超时秒：默认与第 1 轮同款；第 2 轮配置了独立单候选超时（>0）则三个阶段统一替换。
+		// 注意探测超时保持受 verify_tls 开关控制（probeTimeout 为 0 = 不探测，独立超时不得把探测“打开”）
+		probeT, dialT, peekT := probeTimeout, cfg.DialTimeout, cfg.FirstByteTimeout
+		if plan != nil && plan.stageTimeout > 0 {
+			if probeT > 0 {
+				probeT = plan.stageTimeout
+			}
+			dialT = plan.stageTimeout
+			peekT = plan.stageTimeout
+		}
+		// 整轮预算（again_proxy_budget>0 时）：每个候选开始前检查剩余预算，并把各阶段超时收窄到
+		// min(阶段超时, 剩余预算)；预算耗尽则输出红色连前日志后放弃剩余候选，走现有“所有后端 IP 连接失败”收尾路径
+		if plan != nil && !plan.deadline.IsZero() {
+			remaining := time.Until(plan.deadline)
+			if remaining <= 0 {
+				c.logf(stagePreConnect, 31, false, "AGAIN_PROXY 轮预算耗尽(%v), 放弃剩余 %d 个候选", time.Since(plan.startedAt), len(ordered)-i)
+				return nil
+			}
+			probeT = clampTimeoutSec(probeT, remaining)
+			dialT = clampTimeoutSec(dialT, remaining)
+			peekT = clampTimeoutSec(peekT, remaining)
+		}
+
 		// 后端真实 TLS 验证：候选 IP 必须通过一次真实 TLS 握手（含完整证书校验）才算可用
-		if probeTimeout > 0 {
+		if probeT > 0 {
 			if report { // 第 1 轮：探测结果读写缓存（成功 10 分钟内复用、失败 60 秒内直接跳过）
 				if r, hit := dnsRetryCacheInstance.getVerifyResult(host, ip.String()); !hit {
 					// 未验证过（或缓存已过期）：先探测再连接
-					if err := verifyBackendWithDialer(d, addr, host, probeTimeout); err != nil {
+					if err := verifyBackendWithDialer(d, addr, host, probeT); err != nil {
 						// 验证失败按连接失败处理：记 fail、缓存失败结果，60 秒内不再探测该 IP
 						dnsRetryCacheInstance.setVerifyResult(host, ip.String(), false, err.Error())
 						record(ip, false)
@@ -483,7 +584,7 @@ func dialBackendRound(c *connCtx, host, port string, ordered []net.IP, data []by
 				}
 				// 验证通过（含 10 分钟内缓存命中），继续走下面的正常连接流程
 			} else { // 代理轮询：探测握手经代理拨号，结果不读写验证缓存（代理链路的可用性与直连无关）
-				if err := verifyBackendWithDialer(d, addr, host, probeTimeout); err != nil {
+				if err := verifyBackendWithDialer(d, addr, host, probeT); err != nil {
 					c.logf(stagePreConnect, 31, false, "后端验证失败%s%s: [%s], %v", roundTag, attempt, addr, err)
 					continue
 				}
@@ -492,7 +593,7 @@ func dialBackendRound(c *connCtx, host, port string, ordered []net.IP, data []by
 		}
 
 		dialStart := time.Now()
-		backend, err := dialWithDialer(d, "tcp", addr, cfg.DialTimeout)
+		backend, err := dialWithDialer(d, "tcp", addr, dialT)
 		dialElapsed := time.Since(dialStart) // 本次拨号耗时（成功/失败日志都会带上）
 		if err != nil {                      // 连接失败，记录结果并自动重试下一个 IP
 			record(ip, false)
@@ -508,7 +609,7 @@ func dialBackendRound(c *connCtx, host, port string, ordered []net.IP, data []by
 		}
 
 		// 等待后端返回第一个响应字节（识别假死后端），提前读到的数据由调用方转发给客户端
-		first, ok := peekFirstByte(backend, cfg.FirstByteTimeout)
+		first, ok := peekFirstByte(backend, peekT)
 		if !ok {
 			backend.Close()
 			record(ip, false)
@@ -517,7 +618,7 @@ func dialBackendRound(c *connCtx, host, port string, ordered []net.IP, data []by
 		}
 
 		// 校验首个响应是不是合法的 TLS 握手记录（识别“回了数据但不是正常 TLS 服务”的坏 IP）
-		if probeTimeout > 0 && !isValidServerHello(first) {
+		if probeT > 0 && !isValidServerHello(first) {
 			backend.Close()
 			record(ip, false)
 			c.logf(stagePreConnect, 31, false, "后端响应异常%s%s: [%s], 不是合法的 TLS ServerHello 记录", roundTag, attempt, addr)
